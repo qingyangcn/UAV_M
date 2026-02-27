@@ -416,7 +416,7 @@ def main():
                         help="Stop accepting orders this many steps before business end (default: 0=disabled)")
 
     # Ablation parameters
-    parser.add_argument("--ablation-cutoff", action="store_true", default=False,
+    parser.add_argument("--ablation-cutoff", action="store_true", default=True,
                         help="Enable K-sweep ablation mode for order_cutoff_steps")
     parser.add_argument("--cutoff-values", type=str, default="0,6,12,18,24",
                         help="Comma-separated K values to sweep in ablation mode (default: 0,6,12,18,24)")
