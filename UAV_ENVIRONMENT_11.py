@@ -4046,6 +4046,7 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                 'customer_location': customer_loc,
                 'status': OrderStatus.PENDING,
                 'creation_time': self.time_system.current_step,
+                'creation_step': self.time_system.current_step,  # explicit step-coordinate field for SC/GC stats
                 'assigned_drone': -1,
                 'preparation_time': preparation_time,  # step
                 'urgent': random.random() < order_details['urgency'],
