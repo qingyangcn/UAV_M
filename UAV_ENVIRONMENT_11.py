@@ -1077,7 +1077,7 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                  base_placement_method='kmeans',
                  drone_max_capacity=10,
                  operating_hours=(6, 22),
-                 high_load_factor=1.3,
+                 high_load_factor=1.5,
                  distance_reward_weight=1.0,
                  multi_objective_mode: str = "conditioned",
                  fixed_objective_weights=(0.5, 0.3, 0.2),
@@ -1109,6 +1109,8 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                  energy_e0: float = 0.1,  # Base energy consumption per unit distance (battery_units/distance_unit)
                  energy_alpha: float = 0.5,  # Load coefficient for energy consumption
                  battery_return_threshold: float = 10.0,  # Low battery threshold for forced return (battery_units)
+                 # ===== Order cutoff window =====
+                 order_cutoff_steps: int = 0,  # Stop accepting orders this many steps before business end (0=disabled)
                  ):
         super().__init__()
 
@@ -1192,6 +1194,9 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         self.energy_e0 = float(energy_e0)  # Base energy per distance
         self.energy_alpha = float(energy_alpha)  # Load coefficient
         self.battery_return_threshold = float(battery_return_threshold)  # Low battery threshold
+
+        # ========== Order cutoff window ==========
+        self.order_cutoff_steps = int(order_cutoff_steps)  # Steps before business end to stop accepting orders
 
         # ========== shaping 参数 ==========
         self.shaping_progress_k = float(shaping_progress_k)
@@ -3962,10 +3967,23 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
 
     # ------------------ order generation ------------------
 
+    def _get_business_end_step(self) -> int:
+        """Return the step number at which business hours end for the current day.
+
+        current_step starts at 0 and business hours span steps [0, steps_per_day).
+        Therefore business ends at step steps_per_day.
+        """
+        return self.time_system.steps_per_day
+
     def _generate_new_orders(self):
         time_state = self.time_system.get_time_state()
         if not time_state['is_business_hours']:
             return
+
+        if self.order_cutoff_steps > 0:
+            business_end_step = self._get_business_end_step()
+            if self.time_system.current_step >= business_end_step - self.order_cutoff_steps:
+                return
 
         order_prob = self.order_processor.get_order_probability(
             env_time=self.time_system.current_step,
