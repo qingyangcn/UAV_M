@@ -113,29 +113,47 @@ def _make_env(args, order_cutoff_steps: int = 0) -> ThreeObjectiveDroneDeliveryE
     )
 
 
-def _compute_completion_stats(env: ThreeObjectiveDroneDeliveryEnv) -> dict:
-    """Compute general and serviceable completion statistics from a finished episode."""
+def _compute_completion_stats(env: ThreeObjectiveDroneDeliveryEnv, sc_cutoff_steps: int = None) -> dict:
+    """Compute general and serviceable completion statistics from a finished episode.
+
+    Args:
+        env: The finished environment.
+        sc_cutoff_steps: K value used for the serviceable-completion threshold
+            (``threshold = business_end_step - sc_cutoff_steps``).  When *None*
+            the value is read from ``env.order_cutoff_steps``.  Pass the
+            ablation K explicitly so that the threshold is independent of
+            whether the environment was run with a generation cutoff.
+    """
     business_end_step = env._get_business_end_step()
-    K = env.order_cutoff_steps
+    K = sc_cutoff_steps if sc_cutoff_steps is not None else env.order_cutoff_steps
 
     generated_total = env.daily_stats['orders_generated']
     completed_total = env.daily_stats['orders_completed']
 
     general_completion = completed_total / generated_total if generated_total > 0 else 0.0
 
-    cutoff_step = business_end_step - K
+    threshold = business_end_step - K
+
+    def _order_creation_step(o):
+        return o.get('creation_step', o.get('creation_time', 0))
+
     serviceable_generated = sum(
         1 for o in env.orders.values()
-        if o.get('creation_time', 0) < cutoff_step
+        if _order_creation_step(o) < threshold
     )
     serviceable_completed = sum(
         1 for oid in env.completed_orders
-        if oid in env.orders and env.orders[oid].get('creation_time', 0) < cutoff_step
+        if oid in env.orders and _order_creation_step(env.orders[oid]) < threshold
     )
     if serviceable_generated > 0:
         serviceable_completion = serviceable_completed / serviceable_generated
     else:
         serviceable_completion = float('nan')
+
+    # Diagnostics: verify SC partition is effective
+    all_creation_steps = [_order_creation_step(o) for o in env.orders.values()]
+    max_creation_step = max(all_creation_steps) if all_creation_steps else 0
+    num_tail_orders = sum(1 for cs in all_creation_steps if cs >= threshold)
 
     return {
         'generated_total': generated_total,
@@ -144,14 +162,25 @@ def _compute_completion_stats(env: ThreeObjectiveDroneDeliveryEnv) -> dict:
         'serviceable_generated': serviceable_generated,
         'serviceable_completed': serviceable_completed,
         'serviceable_completion': serviceable_completion,
+        '_diag_business_end_step': business_end_step,
+        '_diag_threshold': threshold,
+        '_diag_max_creation_step': max_creation_step,
+        '_diag_num_tail_orders': num_tail_orders,
     }
 
 
 def run_single_episode(args, order_cutoff_steps: int, seed: int) -> dict:
-    """Run one episode and return completion stats."""
+    """Run one episode and return completion stats.
+
+    The environment is always created **without** a generation cutoff so that
+    orders are generated right up to business-end.  *order_cutoff_steps* (K)
+    is used exclusively as the post-hoc SC threshold, ensuring
+    ``serviceable_generated < generated_total`` whenever orders are generated
+    inside the last K steps (i.e. K > 0).
+    """
     np.random.seed(seed)
 
-    env = _make_env(args, order_cutoff_steps=order_cutoff_steps)
+    env = _make_env(args, order_cutoff_steps=0)
 
     if _HAS_MOPSO:
         candidate_generator = MOPSOCandidateGenerator(
@@ -175,7 +204,7 @@ def run_single_episode(args, order_cutoff_steps: int, seed: int) -> dict:
 
     executor.run_episode(max_steps=args.max_steps)
 
-    stats = _compute_completion_stats(env)
+    stats = _compute_completion_stats(env, sc_cutoff_steps=order_cutoff_steps)
     stats['order_cutoff_steps'] = order_cutoff_steps
     stats['seed'] = seed
     return stats
@@ -206,7 +235,9 @@ def run_ablation_cutoff(args):
             rows.append(row)
             sc = row['serviceable_completion']
             sc_str = f"{sc:.4f}" if not math.isnan(sc) else "nan"
-            print(f"GC={row['general_completion']:.4f}  SC={sc_str}")
+            print(f"GC={row['general_completion']:.4f}  SC={sc_str}  "
+                  f"[bus_end={row['_diag_business_end_step']}  threshold={row['_diag_threshold']}  "
+                  f"max_cs={row['_diag_max_creation_step']}  tail={row['_diag_num_tail_orders']}]")
 
     if args.csv_out:
         with open(args.csv_out, 'w', newline='') as f:
