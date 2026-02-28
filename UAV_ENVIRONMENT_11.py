@@ -1077,7 +1077,7 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                  base_placement_method='kmeans',
                  drone_max_capacity=10,
                  operating_hours=(6, 22),
-                 high_load_factor=1.5,
+                 high_load_factor=1.3,
                  distance_reward_weight=1.0,
                  multi_objective_mode: str = "conditioned",
                  fixed_objective_weights=(0.5, 0.3, 0.2),
@@ -4046,6 +4046,7 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                 'customer_location': customer_loc,
                 'status': OrderStatus.PENDING,
                 'creation_time': self.time_system.current_step,
+                'creation_step': self.time_system.current_step,  # explicit step-coordinate field for SC/GC stats
                 'assigned_drone': -1,
                 'preparation_time': preparation_time,  # step
                 'urgent': random.random() < order_details['urgency'],
