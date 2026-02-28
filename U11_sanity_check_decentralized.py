@@ -16,14 +16,9 @@ Usage:
 
     # Quick test (fewer steps)
     python U11_sanity_check_decentralized.py --max-steps 100
-
-    # Ablation: scan order cutoff K values across multiple seeds
-    python U11_sanity_check_decentralized.py --ablation-cutoff --cutoff-values 0,6,12,18,24 --seeds 42,43 --csv-out out.csv
 """
 
 import argparse
-import csv
-import math
 import os
 import sys
 from collections import Counter
@@ -34,13 +29,8 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from UAV_ENVIRONMENT_11 import ThreeObjectiveDroneDeliveryEnv
+from U10_candidate_generator import MOPSOCandidateGenerator
 from U11_decentralized_execution import DecentralizedEventDrivenExecutor
-
-try:
-    from U10_candidate_generator import MOPSOCandidateGenerator
-    _HAS_MOPSO = True
-except ImportError:
-    _HAS_MOPSO = False
 
 
 def random_policy(local_obs: dict) -> int:
@@ -86,9 +76,15 @@ def load_trained_policy(model_path: str, vecnormalize_path: str = None):
     return policy_fn
 
 
-def _make_env(args, order_cutoff_steps: int = 0) -> ThreeObjectiveDroneDeliveryEnv:
-    """Create environment with the given configuration."""
-    return ThreeObjectiveDroneDeliveryEnv(
+def run_sanity_check(args):
+    """Run sanity check with specified configuration."""
+    print("=" * 80)
+    print("U11 Decentralized Execution Sanity Check")
+    print("=" * 80)
+
+    # Create environment
+    print("\nCreating environment...")
+    env = ThreeObjectiveDroneDeliveryEnv(
         grid_size=16,
         num_drones=args.num_drones,
         max_orders=args.obs_max_orders,
@@ -109,200 +105,19 @@ def _make_env(args, order_cutoff_steps: int = 0) -> ThreeObjectiveDroneDeliveryE
         multi_objective_mode="fixed",
         candidate_update_interval=8,
         candidate_fallback_enabled=False,
-        order_cutoff_steps=order_cutoff_steps,
     )
-
-
-def _compute_completion_stats(env: ThreeObjectiveDroneDeliveryEnv) -> dict:
-    """Compute general and serviceable completion statistics from a finished episode."""
-    business_end_step = env._get_business_end_step()
-    K = env.order_cutoff_steps
-
-    generated_total = env.daily_stats['orders_generated']
-    completed_total = env.daily_stats['orders_completed']
-
-    general_completion = completed_total / generated_total if generated_total > 0 else 0.0
-
-    cutoff_step = business_end_step - K
-    serviceable_generated = sum(
-        1 for o in env.orders.values()
-        if o.get('creation_time', 0) < cutoff_step
-    )
-    serviceable_completed = sum(
-        1 for oid in env.completed_orders
-        if oid in env.orders and env.orders[oid].get('creation_time', 0) < cutoff_step
-    )
-    if serviceable_generated > 0:
-        serviceable_completion = serviceable_completed / serviceable_generated
-    else:
-        serviceable_completion = float('nan')
-
-    return {
-        'generated_total': generated_total,
-        'completed_total': completed_total,
-        'general_completion': general_completion,
-        'serviceable_generated': serviceable_generated,
-        'serviceable_completed': serviceable_completed,
-        'serviceable_completion': serviceable_completion,
-    }
-
-
-def run_single_episode(args, order_cutoff_steps: int, seed: int) -> dict:
-    """Run one episode and return completion stats."""
-    np.random.seed(seed)
-
-    env = _make_env(args, order_cutoff_steps=order_cutoff_steps)
-
-    if _HAS_MOPSO:
-        candidate_generator = MOPSOCandidateGenerator(
-            candidate_k=args.candidate_k,
-            n_particles=30,
-            n_iterations=10,
-            max_orders=200,
-            max_orders_per_drone=10,
-            seed=seed,
-        )
-        env.set_candidate_generator(candidate_generator)
-
-    policy_fn = random_policy
-
-    executor = DecentralizedEventDrivenExecutor(
-        env=env,
-        policy_fn=policy_fn,
-        max_skip_steps=args.max_skip_steps,
-        verbose=False,
-    )
-
-    executor.run_episode(max_steps=args.max_steps)
-
-    stats = _compute_completion_stats(env)
-    stats['order_cutoff_steps'] = order_cutoff_steps
-    stats['seed'] = seed
-    return stats
-
-
-def run_ablation_cutoff(args):
-    """Run K-sweep ablation and write CSV."""
-    cutoff_values = [int(v.strip()) for v in args.cutoff_values.split(',')]
-    seeds = [int(s.strip()) for s in args.seeds.split(',')]
-
-    print("=" * 80)
-    print("Ablation: Order Cutoff Steps (K) Sweep")
-    print(f"  K values: {cutoff_values}")
-    print(f"  Seeds:    {seeds}")
-    print("=" * 80)
-
-    rows = []
-    fieldnames = [
-        'order_cutoff_steps', 'seed',
-        'generated_total', 'completed_total', 'general_completion',
-        'serviceable_generated', 'serviceable_completed', 'serviceable_completion',
-    ]
-
-    for K in cutoff_values:
-        for seed in seeds:
-            print(f"  Running K={K}, seed={seed} ...", end=' ', flush=True)
-            row = run_single_episode(args, order_cutoff_steps=K, seed=seed)
-            rows.append(row)
-            sc = row['serviceable_completion']
-            sc_str = f"{sc:.4f}" if not math.isnan(sc) else "nan"
-            print(f"GC={row['general_completion']:.4f}  SC={sc_str}")
-
-    if args.csv_out:
-        with open(args.csv_out, 'w', newline='') as f:
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
-            writer.writeheader()
-            for row in rows:
-                writer.writerow({k: row[k] for k in fieldnames})
-        print(f"\nCSV written to: {args.csv_out}")
-
-    # Aggregate per K
-    from collections import defaultdict
-    agg = defaultdict(lambda: {'gc': [], 'sc': []})
-    for row in rows:
-        K = row['order_cutoff_steps']
-        agg[K]['gc'].append(row['general_completion'])
-        sc = row['serviceable_completion']
-        if not math.isnan(sc):
-            agg[K]['sc'].append(sc)
-
-    print("\n" + "=" * 80)
-    print("Per-K aggregated means:")
-    print(f"  {'K':>6}  {'mean_GC':>10}  {'mean_SC':>10}")
-    summary = {}
-    for K in cutoff_values:
-        gc_list = agg[K]['gc']
-        sc_list = agg[K]['sc']
-        mean_gc = float(np.mean(gc_list)) if gc_list else float('nan')
-        mean_sc = float(np.mean(sc_list)) if sc_list else float('nan')
-        summary[K] = {'mean_gc': mean_gc, 'mean_sc': mean_sc}
-        gc_str = f"{mean_gc:.4f}" if not math.isnan(mean_gc) else "nan"
-        sc_str = f"{mean_sc:.4f}" if not math.isnan(mean_sc) else "nan"
-        print(f"  {K:>6}  {gc_str:>10}  {sc_str:>10}")
-
-    # Determine best K
-    valid_gc = {K: v['mean_gc'] for K, v in summary.items() if not math.isnan(v['mean_gc'])}
-    valid_sc = {K: v['mean_sc'] for K, v in summary.items() if not math.isnan(v['mean_sc'])}
-
-    if not valid_gc and not valid_sc:
-        print("\nInsufficient data to determine best K.")
-        return
-
-    K_g = min((K for K, v in valid_gc.items() if v == max(valid_gc.values()))) if valid_gc else None
-    K_s = min((K for K, v in valid_sc.items() if v == max(valid_sc.values()))) if valid_sc else None
-
-    EPS = 1e-9
-    print("\n" + "=" * 80)
-    if K_g is not None and K_s is not None and K_g == K_s:
-        print(f"Recommended K (joint optimum): K={K_g}")
-    else:
-        if K_g is not None:
-            print(f"K_g  (best mean_GC={summary[K_g]['mean_gc']:.4f}): K={K_g}")
-        if K_s is not None:
-            print(f"K_s  (best mean_SC={summary[K_s]['mean_sc']:.4f}): K={K_s}")
-        # Balanced: max min(mean_gc, mean_sc)
-        balanced_candidates = {K: min(v['mean_gc'], v['mean_sc'])
-                                for K, v in summary.items()
-                                if not math.isnan(v['mean_gc']) and not math.isnan(v['mean_sc'])}
-        if balanced_candidates:
-            best_balanced_val = max(balanced_candidates.values())
-            K_balanced = min(K for K, v in balanced_candidates.items() if abs(v - best_balanced_val) < EPS)
-            print(f"K_balanced (max min(GC,SC)={best_balanced_val:.4f}): K={K_balanced}")
-
-        # Also report max product
-        product_candidates = {K: v['mean_gc'] * v['mean_sc']
-                              for K, v in summary.items()
-                              if not math.isnan(v['mean_gc']) and not math.isnan(v['mean_sc'])}
-        if product_candidates:
-            best_product_val = max(product_candidates.values())
-            K_product = min(K for K, v in product_candidates.items() if abs(v - best_product_val) < EPS)
-            print(f"K_product (max GC*SC={best_product_val:.4f}): K={K_product}")
-
-    print("=" * 80)
-
-
-def run_sanity_check(args):
-    """Run sanity check with specified configuration."""
-    print("=" * 80)
-    print("U11 Decentralized Execution Sanity Check")
-    print("=" * 80)
-
-    # Create environment
-    print("\nCreating environment...")
-    env = _make_env(args, order_cutoff_steps=args.order_cutoff_steps)
 
     # Create MOPSO candidate generator
-    if _HAS_MOPSO:
-        print("Creating MOPSO candidate generator...")
-        candidate_generator = MOPSOCandidateGenerator(
-            candidate_k=args.candidate_k,
-            n_particles=30,
-            n_iterations=10,
-            max_orders=200,
-            max_orders_per_drone=10,
-            seed=args.seed,
-        )
-        env.set_candidate_generator(candidate_generator)
+    print("Creating MOPSO candidate generator...")
+    candidate_generator = MOPSOCandidateGenerator(
+        candidate_k=args.candidate_k,
+        n_particles=30,
+        n_iterations=10,
+        max_orders=200,
+        max_orders_per_drone=10,
+        seed=args.seed,
+    )
+    env.set_candidate_generator(candidate_generator)
 
     # Choose policy
     if args.model_path:
@@ -358,17 +173,7 @@ def run_sanity_check(args):
                                     key=lambda x: -x[1]):
             print(f"  {reason}: {count}")
 
-    # Completion stats
-    completion = _compute_completion_stats(env)
-    print(f"\nCompletion Statistics:")
-    print(f"  Generated Total:          {completion['generated_total']}")
-    print(f"  Completed Total:          {completion['completed_total']}")
-    print(f"  General Completion:       {completion['general_completion']:.4f}")
-    print(f"  Serviceable Generated:    {completion['serviceable_generated']}")
-    print(f"  Serviceable Completed:    {completion['serviceable_completed']}")
-    sc = completion['serviceable_completion']
-    sc_str = f"{sc:.4f}" if not math.isnan(sc) else "nan"
-    print(f"  Serviceable Completion:   {sc_str}")
+
 
     if stats['total_decisions'] == 0:
         print("\n⚠ WARNING: No decisions were made during the episode!")
@@ -411,20 +216,6 @@ def main():
     parser.add_argument("--vecnormalize-path", type=str, default='vecnormalize_u11_final.pkl',
                         help="Path to VecNormalize stats (.pkl file)")
 
-    # Order cutoff parameter
-    parser.add_argument("--order-cutoff-steps", type=int, default=0,
-                        help="Stop accepting orders this many steps before business end (default: 0=disabled)")
-
-    # Ablation parameters
-    parser.add_argument("--ablation-cutoff", action="store_true", default=True,
-                        help="Enable K-sweep ablation mode for order_cutoff_steps")
-    parser.add_argument("--cutoff-values", type=str, default="0,6,12,18,24",
-                        help="Comma-separated K values to sweep in ablation mode (default: 0,6,12,18,24)")
-    parser.add_argument("--seeds", type=str, default="42",
-                        help="Comma-separated seed list for ablation mode (default: 42)")
-    parser.add_argument("--csv-out", type=str, default=None,
-                        help="Output CSV path for ablation results")
-
     # Other parameters
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed (default: 42)")
@@ -433,32 +224,20 @@ def main():
 
     args = parser.parse_args()
 
-    if args.ablation_cutoff:
-        try:
-            run_ablation_cutoff(args)
-        except Exception as e:
-            print("\n" + "=" * 80)
-            print("Ablation FAILED ✗")
-            print("=" * 80)
-            print(f"\nError: {e}")
-            import traceback
-            traceback.print_exc()
-            sys.exit(1)
-    else:
-        # Set random seed for single run
-        np.random.seed(args.seed)
+    # Set random seed
+    np.random.seed(args.seed)
 
-        # Run sanity check
-        try:
-            run_sanity_check(args)
-        except Exception as e:
-            print("\n" + "=" * 80)
-            print("Sanity Check FAILED ✗")
-            print("=" * 80)
-            print(f"\nError: {e}")
-            import traceback
-            traceback.print_exc()
-            sys.exit(1)
+    # Run sanity check
+    try:
+        run_sanity_check(args)
+    except Exception as e:
+        print("\n" + "=" * 80)
+        print("Sanity Check FAILED ✗")
+        print("=" * 80)
+        print(f"\nError: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
 
 
 if __name__ == "__main__":
