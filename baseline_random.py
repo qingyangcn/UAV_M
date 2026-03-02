@@ -44,8 +44,6 @@ def policy_fn(local_obs: dict) -> int:
 
 def run_episode(args, seed: int) -> dict:
     """Run one episode with random policy and return completion stats."""
-    np.random.seed(seed)
-
     env = _make_env(args, order_cutoff_steps=0)
 
     if args.use_mopso and _HAS_MOPSO:
@@ -66,9 +64,9 @@ def run_episode(args, seed: int) -> dict:
         verbose=False,
     )
 
-    executor.run_episode(max_steps=args.max_steps)
+    executor.run_episode(max_steps=args.max_steps, seed=seed)
 
-    stats = _compute_completion_stats(env, sc_cutoff_steps=args.candidate_k)
+    stats = _compute_completion_stats(env)
     stats['seed'] = seed
     stats['policy'] = 'random'
     return stats
@@ -76,15 +74,10 @@ def run_episode(args, seed: int) -> dict:
 
 def print_stats(stats: dict):
     """Print completion statistics in a standard format."""
-    sc = stats['serviceable_completion']
-    sc_str = f"{sc:.4f}" if not math.isnan(sc) else "nan"
     print(f"  seed={stats['seed']}  "
           f"generated_total={stats['generated_total']}  "
           f"completed_total={stats['completed_total']}  "
-          f"general_completion={stats['general_completion']:.4f}  "
-          f"serviceable_generated={stats['serviceable_generated']}  "
-          f"serviceable_completed={stats['serviceable_completed']}  "
-          f"serviceable_completion={sc_str}")
+          f"general_completion={stats['general_completion']:.4f}")
 
 
 def main():
@@ -137,12 +130,8 @@ def main():
 
     if len(all_stats) > 1:
         gc_values = [s['general_completion'] for s in all_stats]
-        sc_values = [s['serviceable_completion'] for s in all_stats
-                     if not math.isnan(s['serviceable_completion'])]
         print("-" * 80)
-        print(f"  mean_general_completion={float(np.mean(gc_values)):.4f}  "
-              f"mean_serviceable_completion="
-              f"{float(np.mean(sc_values)):.4f if sc_values else 'nan'}")
+        print(f"  mean_general_completion={float(np.mean(gc_values)):.4f}")
 
     print("=" * 80)
     return all_stats
