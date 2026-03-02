@@ -1077,7 +1077,7 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                  base_placement_method='kmeans',
                  drone_max_capacity=10,
                  operating_hours=(6, 22),
-                 high_load_factor=1.3,
+                 high_load_factor=1.6,
                  distance_reward_weight=1.0,
                  multi_objective_mode: str = "conditioned",
                  fixed_objective_weights=(0.5, 0.3, 0.2),
