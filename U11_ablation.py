@@ -1,24 +1,23 @@
 """
-U11 Sanity Check for Decentralized Event-Driven Execution
+U11 Ablation & Sanity Check for Decentralized Event-Driven Execution
 
-This script validates the decentralized event-driven execution system by:
-1. Running a small episode with random policy
-2. Testing event-driven loop functionality
-3. Printing statistics (decisions, skips, success/failure rates)
-4. Optionally loading and testing a trained policy
+K (order_cutoff_steps) definition — **Mode 1 only**:
+    The environment stops generating/accepting new orders K steps before the
+    business-end step, but continues delivering already-accepted orders until
+    the episode finishes.  K=0 means no early cutoff.
 
 Usage:
-    # Test with random policy
-    python U11_sanity_check_decentralized.py
+    # Test with random policy (single episode)
+    python U11_ablation.py
 
     # Test with trained policy
-    python U11_sanity_check_decentralized.py --model-path ./models/u10/ppo_u10_final.zip
+    python U11_ablation.py --model-path ./models/u10/ppo_u10_final.zip
 
     # Quick test (fewer steps)
-    python U11_sanity_check_decentralized.py --max-steps 100
+    python U11_ablation.py --max-steps 100
 
-    # Ablation: scan order cutoff K values across multiple seeds
-    python U11_sanity_check_decentralized.py --ablation-cutoff --cutoff-values 0,6,12,18,24 --seeds 42,43 --csv-out out.csv
+    # Ablation: scan environment order_cutoff_steps (K) across multiple seeds
+    python U11_ablation.py --ablation-cutoff --cutoff-values 0,6,12,18,24 --seeds 42,43 --csv-out out.csv
 """
 
 import argparse
@@ -113,74 +112,36 @@ def _make_env(args, order_cutoff_steps: int = 0) -> ThreeObjectiveDroneDeliveryE
     )
 
 
-def _compute_completion_stats(env: ThreeObjectiveDroneDeliveryEnv, sc_cutoff_steps: int = None) -> dict:
-    """Compute general and serviceable completion statistics from a finished episode.
+def _compute_completion_stats(env: ThreeObjectiveDroneDeliveryEnv) -> dict:
+    """Compute general completion statistics from a finished episode.
 
     Args:
         env: The finished environment.
-        sc_cutoff_steps: K value used for the serviceable-completion threshold
-            (``threshold = business_end_step - sc_cutoff_steps``).  When *None*
-            the value is read from ``env.order_cutoff_steps``.  Pass the
-            ablation K explicitly so that the threshold is independent of
-            whether the environment was run with a generation cutoff.
-    """
-    business_end_step = env._get_business_end_step()
-    K = sc_cutoff_steps if sc_cutoff_steps is not None else env.order_cutoff_steps
 
+    Returns:
+        Dict with keys: generated_total, completed_total, general_completion.
+    """
     generated_total = env.daily_stats['orders_generated']
     completed_total = env.daily_stats['orders_completed']
-
     general_completion = completed_total / generated_total if generated_total > 0 else 0.0
-
-    threshold = business_end_step - K
-
-    def _order_creation_step(o):
-        return o.get('creation_step', o.get('creation_time', 0))
-
-    serviceable_generated = sum(
-        1 for o in env.orders.values()
-        if _order_creation_step(o) < threshold
-    )
-    serviceable_completed = sum(
-        1 for oid in env.completed_orders
-        if oid in env.orders and _order_creation_step(env.orders[oid]) < threshold
-    )
-    if serviceable_generated > 0:
-        serviceable_completion = serviceable_completed / serviceable_generated
-    else:
-        serviceable_completion = float('nan')
-
-    # Diagnostics: verify SC partition is effective
-    all_creation_steps = [_order_creation_step(o) for o in env.orders.values()]
-    max_creation_step = max(all_creation_steps) if all_creation_steps else 0
-    num_tail_orders = sum(1 for cs in all_creation_steps if cs >= threshold)
 
     return {
         'generated_total': generated_total,
         'completed_total': completed_total,
         'general_completion': general_completion,
-        'serviceable_generated': serviceable_generated,
-        'serviceable_completed': serviceable_completed,
-        'serviceable_completion': serviceable_completion,
-        '_diag_business_end_step': business_end_step,
-        '_diag_threshold': threshold,
-        '_diag_max_creation_step': max_creation_step,
-        '_diag_num_tail_orders': num_tail_orders,
     }
 
 
 def run_single_episode(args, order_cutoff_steps: int, seed: int) -> dict:
     """Run one episode and return completion stats.
 
-    The environment is always created **without** a generation cutoff so that
-    orders are generated right up to business-end.  *order_cutoff_steps* (K)
-    is used exclusively as the post-hoc SC threshold, ensuring
-    ``serviceable_generated < generated_total`` whenever orders are generated
-    inside the last K steps (i.e. K > 0).
+    The environment is created with *order_cutoff_steps* (K) so that order
+    generation stops K steps before business-end (Mode 1).  Delivery of
+    already-accepted orders continues until the episode finishes.
     """
     np.random.seed(seed)
 
-    env = _make_env(args, order_cutoff_steps=0)
+    env = _make_env(args, order_cutoff_steps=order_cutoff_steps)
 
     if _HAS_MOPSO:
         candidate_generator = MOPSOCandidateGenerator(
@@ -204,7 +165,7 @@ def run_single_episode(args, order_cutoff_steps: int, seed: int) -> dict:
 
     executor.run_episode(max_steps=args.max_steps)
 
-    stats = _compute_completion_stats(env, sc_cutoff_steps=order_cutoff_steps)
+    stats = _compute_completion_stats(env)
     stats['order_cutoff_steps'] = order_cutoff_steps
     stats['seed'] = seed
     return stats
@@ -225,7 +186,6 @@ def run_ablation_cutoff(args):
     fieldnames = [
         'order_cutoff_steps', 'seed',
         'generated_total', 'completed_total', 'general_completion',
-        'serviceable_generated', 'serviceable_completed', 'serviceable_completion',
     ]
 
     for K in cutoff_values:
@@ -233,11 +193,8 @@ def run_ablation_cutoff(args):
             print(f"  Running K={K}, seed={seed} ...", end=' ', flush=True)
             row = run_single_episode(args, order_cutoff_steps=K, seed=seed)
             rows.append(row)
-            sc = row['serviceable_completion']
-            sc_str = f"{sc:.4f}" if not math.isnan(sc) else "nan"
-            print(f"GC={row['general_completion']:.4f}  SC={sc_str}  "
-                  f"[bus_end={row['_diag_business_end_step']}  threshold={row['_diag_threshold']}  "
-                  f"max_cs={row['_diag_max_creation_step']}  tail={row['_diag_num_tail_orders']}]")
+            print(f"GC={row['general_completion']:.4f}  "
+                  f"generated={row['generated_total']}  completed={row['completed_total']}")
 
     if args.csv_out:
         with open(args.csv_out, 'w', newline='') as f:
@@ -249,65 +206,33 @@ def run_ablation_cutoff(args):
 
     # Aggregate per K
     from collections import defaultdict
-    agg = defaultdict(lambda: {'gc': [], 'sc': []})
+    agg = defaultdict(lambda: {'gc': []})
     for row in rows:
         K = row['order_cutoff_steps']
         agg[K]['gc'].append(row['general_completion'])
-        sc = row['serviceable_completion']
-        if not math.isnan(sc):
-            agg[K]['sc'].append(sc)
 
     print("\n" + "=" * 80)
     print("Per-K aggregated means:")
-    print(f"  {'K':>6}  {'mean_GC':>10}  {'mean_SC':>10}")
+    print(f"  {'K':>6}  {'mean_GC':>10}")
     summary = {}
     for K in cutoff_values:
         gc_list = agg[K]['gc']
-        sc_list = agg[K]['sc']
         mean_gc = float(np.mean(gc_list)) if gc_list else float('nan')
-        mean_sc = float(np.mean(sc_list)) if sc_list else float('nan')
-        summary[K] = {'mean_gc': mean_gc, 'mean_sc': mean_sc}
+        summary[K] = {'mean_gc': mean_gc}
         gc_str = f"{mean_gc:.4f}" if not math.isnan(mean_gc) else "nan"
-        sc_str = f"{mean_sc:.4f}" if not math.isnan(mean_sc) else "nan"
-        print(f"  {K:>6}  {gc_str:>10}  {sc_str:>10}")
+        print(f"  {K:>6}  {gc_str:>10}")
 
-    # Determine best K
+    # Determine best K by GC
     valid_gc = {K: v['mean_gc'] for K, v in summary.items() if not math.isnan(v['mean_gc'])}
-    valid_sc = {K: v['mean_sc'] for K, v in summary.items() if not math.isnan(v['mean_sc'])}
 
-    if not valid_gc and not valid_sc:
+    if not valid_gc:
         print("\nInsufficient data to determine best K.")
         return
 
-    K_g = min((K for K, v in valid_gc.items() if v == max(valid_gc.values()))) if valid_gc else None
-    K_s = min((K for K, v in valid_sc.items() if v == max(valid_sc.values()))) if valid_sc else None
+    K_g, best_gc_val = min(valid_gc.items(), key=lambda kv: (-kv[1], kv[0]))
 
-    EPS = 1e-9
     print("\n" + "=" * 80)
-    if K_g is not None and K_s is not None and K_g == K_s:
-        print(f"Recommended K (joint optimum): K={K_g}")
-    else:
-        if K_g is not None:
-            print(f"K_g  (best mean_GC={summary[K_g]['mean_gc']:.4f}): K={K_g}")
-        if K_s is not None:
-            print(f"K_s  (best mean_SC={summary[K_s]['mean_sc']:.4f}): K={K_s}")
-        # Balanced: max min(mean_gc, mean_sc)
-        balanced_candidates = {K: min(v['mean_gc'], v['mean_sc'])
-                                for K, v in summary.items()
-                                if not math.isnan(v['mean_gc']) and not math.isnan(v['mean_sc'])}
-        if balanced_candidates:
-            best_balanced_val = max(balanced_candidates.values())
-            K_balanced = min(K for K, v in balanced_candidates.items() if abs(v - best_balanced_val) < EPS)
-            print(f"K_balanced (max min(GC,SC)={best_balanced_val:.4f}): K={K_balanced}")
-
-        # Also report max product
-        product_candidates = {K: v['mean_gc'] * v['mean_sc']
-                              for K, v in summary.items()
-                              if not math.isnan(v['mean_gc']) and not math.isnan(v['mean_sc'])}
-        if product_candidates:
-            best_product_val = max(product_candidates.values())
-            K_product = min(K for K, v in product_candidates.items() if abs(v - best_product_val) < EPS)
-            print(f"K_product (max GC*SC={best_product_val:.4f}): K={K_product}")
+    print(f"Recommended K (best mean_GC={best_gc_val:.4f}): K={K_g}")
 
     print("=" * 80)
 
@@ -395,11 +320,6 @@ def run_sanity_check(args):
     print(f"  Generated Total:          {completion['generated_total']}")
     print(f"  Completed Total:          {completion['completed_total']}")
     print(f"  General Completion:       {completion['general_completion']:.4f}")
-    print(f"  Serviceable Generated:    {completion['serviceable_generated']}")
-    print(f"  Serviceable Completed:    {completion['serviceable_completed']}")
-    sc = completion['serviceable_completion']
-    sc_str = f"{sc:.4f}" if not math.isnan(sc) else "nan"
-    print(f"  Serviceable Completion:   {sc_str}")
 
     if stats['total_decisions'] == 0:
         print("\n⚠ WARNING: No decisions were made during the episode!")
@@ -448,11 +368,13 @@ def main():
 
     # Ablation parameters
     parser.add_argument("--ablation-cutoff", action="store_true", default=True,
-                        help="Enable K-sweep ablation mode for order_cutoff_steps")
+                        help="Enable K-sweep ablation mode: scan environment order_cutoff_steps "
+                             "(stops order generation K steps before business end)")
     parser.add_argument("--cutoff-values", type=str, default="0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,"
                                                              "21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,"
                                                              "41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60",
-                        help="Comma-separated K values to sweep in ablation mode (default: 0,6,12,18,24)")
+                        help="Comma-separated environment order_cutoff_steps (K) values to sweep "
+                             "in ablation mode (default: 0..60)")
     parser.add_argument("--seeds", type=str, default="21",
                         help="Comma-separated seed list for ablation mode (default: 42)")
     parser.add_argument("--csv-out", type=str, default=None,
