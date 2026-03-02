@@ -35,14 +35,25 @@ class DecentralizedEventDrivenExecutor:
     This executor:
     1. Detects drones at decision points using env.get_decision_drones()
     2. For each decision drone, extracts local observation and calls policy
-    3. Submits rule_id to centralized arbitration via env.apply_rule_to_drone()
+    3. Submits the action to centralized arbitration via the environment
     4. Fast-forwards environment when no drones need decisions
 
+    Supported action modes (``action_mode`` parameter):
+
+    * ``"rule_id"`` *(default)* – ``policy_fn(local_obs)`` returns an integer
+      rule_id in ``{0, 1, 2, 3, 4}``.  The environment selects an order
+      according to that rule via ``apply_rule_to_drone``.
+    * ``"candidate_index"`` – ``policy_fn(local_obs)`` returns an integer index
+      into the drone's candidate list (``local_obs["candidates"]``).  Return
+      ``-1`` or ``None`` to perform a noop.  The environment commits the
+      selected candidate directly via ``apply_candidate_index_to_drone``.
+
     Args:
-        env: The UAV environment (must have get_decision_drones, apply_rule_to_drone)
-        policy_fn: Function that takes local_obs and returns rule_id (0-4)
+        env: The UAV environment
+        policy_fn: Callable that takes local_obs and returns an action integer
         max_skip_steps: Maximum steps to skip when waiting for decisions
         verbose: Whether to print execution details
+        action_mode: One of ``"rule_id"`` or ``"candidate_index"``
     """
 
     def __init__(
@@ -50,12 +61,14 @@ class DecentralizedEventDrivenExecutor:
             env: gym.Env,
             policy_fn: Callable[[Dict], int],
             max_skip_steps: int = 10,
-            verbose: bool = False
+            verbose: bool = False,
+            action_mode: str = "rule_id",
     ):
         self.env = env
         self.policy_fn = policy_fn
         self.max_skip_steps = max_skip_steps
         self.verbose = verbose
+        self.action_mode = action_mode
 
         # Unwrap environment to access methods
         self.unwrapped_env = env.unwrapped
@@ -204,20 +217,34 @@ class DecentralizedEventDrivenExecutor:
             # Extract local observation for this drone
             local_obs = self._extract_local_observation(current_obs, drone_id)
 
-            # Call policy to get rule_id
-            rule_id = self.policy_fn(local_obs)
+            # Call policy to get action (rule_id or candidate_idx depending on mode)
+            action = self.policy_fn(local_obs)
 
-            # Submit to centralized arbitrator (use with_info if available)
-            if hasattr(self.unwrapped_env, 'apply_rule_to_drone_with_info'):
-                success, decision_info = self.unwrapped_env.apply_rule_to_drone_with_info(
-                    drone_id, rule_id
-                )
-                reason = decision_info.get('failure_reason') or 'unknown'
-                order_id = decision_info.get('order_id')
+            # Submit to centralized arbitrator based on action_mode
+            if self.action_mode == "candidate_index":
+                if hasattr(self.unwrapped_env, 'apply_candidate_index_to_drone_with_info'):
+                    success, decision_info = \
+                        self.unwrapped_env.apply_candidate_index_to_drone_with_info(
+                            drone_id, action
+                        )
+                    reason = decision_info.get('failure_reason') or 'unknown'
+                    order_id = decision_info.get('order_id')
+                else:
+                    success = False
+                    reason = 'unsupported_action_mode'
+                    order_id = None
             else:
-                success = self.unwrapped_env.apply_rule_to_drone(drone_id, rule_id)
-                reason = 'unknown'
-                order_id = None
+                # Default: "rule_id" mode
+                rule_id = action
+                if hasattr(self.unwrapped_env, 'apply_rule_to_drone_with_info'):
+                    success, decision_info = \
+                        self.unwrapped_env.apply_rule_to_drone_with_info(drone_id, rule_id)
+                    reason = decision_info.get('failure_reason') or 'unknown'
+                    order_id = decision_info.get('order_id')
+                else:
+                    success = self.unwrapped_env.apply_rule_to_drone(drone_id, rule_id)
+                    reason = 'unknown'
+                    order_id = None
 
             # Noop / not-eligible reasons: no candidates, drone full, not at decision point
             _noop_reasons = {'no_order_selected', 'drone_at_capacity', 'not_at_decision_point',
@@ -227,7 +254,6 @@ class DecentralizedEventDrivenExecutor:
             if success:
                 self.successful_decisions += 1
                 self.actionable_decisions += 1
-                decision_result = "SUCCESS"
             else:
                 self.failed_decisions += 1
                 if reason in _noop_reasons:
@@ -240,18 +266,19 @@ class DecentralizedEventDrivenExecutor:
                 # Legacy failure reason tracking
                 self.decision_failures_by_reason[reason] = \
                     self.decision_failures_by_reason.get(reason, 0) + 1
-                decision_result = f"FAILED({reason})"
 
             round_decisions.append({
                 'drone_id': drone_id,
-                'rule_id': rule_id,
+                'action_mode': self.action_mode,
+                'action': action,
                 'success': success,
                 'order_id': order_id,
                 'reason': reason if not success else None,
             })
 
             if self.verbose:
-                print(f"  Drone {drone_id}: rule_id={rule_id}, result={decision_result}")
+                print(f"  Drone {drone_id}: action={action} ({self.action_mode}), "
+                      f"result={'SUCCESS' if success else f'FAILED({reason})'}")
 
         # Advance environment one step after all decisions
         # Use dummy action (all zeros) to just advance time
