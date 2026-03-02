@@ -403,17 +403,19 @@ class DecentralizedEventDrivenExecutor:
             'commit_fail_by_reason': dict(self.commit_fail_by_reason),
         }
 
-    def run_episode(self, max_steps: int = 10000) -> Dict[str, Any]:
+    def run_episode(self, max_steps: int = 10000, seed: int = None) -> Dict[str, Any]:
         """
         Run a complete episode from start to finish.
 
         Args:
             max_steps: Maximum number of decision steps
+            seed: Optional random seed forwarded to env.reset(seed=seed) to ensure
+                  deterministic order generation.
 
         Returns:
             Episode statistics
         """
-        obs, info = self.reset()
+        obs, info = self.reset(seed=seed)
 
         for step_num in range(max_steps):
             obs, reward, terminated, truncated, info = self.step()

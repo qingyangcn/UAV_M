@@ -431,6 +431,7 @@ class PathVisualizer:
 class LocationDataLoader:
     def __init__(self, merchant_csv_path, user_csv_path, grid_size=10):
         self.grid_size = grid_size
+        self.rng = np.random.default_rng(0)
         self.merchant_locations = self._load_merchant_locations(merchant_csv_path)
         self.user_locations = self._load_user_locations(user_csv_path)
 
@@ -525,11 +526,11 @@ class LocationDataLoader:
                 'id': f'B{i}',
                 'name': f'商家{i}',
                 'business_type': '餐饮',
-                'longitude': 114.92 + random.uniform(-0.005, 0.005),
-                'latitude': 25.815 + random.uniform(-0.005, 0.005),
+                'longitude': 114.92 + self.rng.uniform(-0.005, 0.005),
+                'latitude': 25.815 + self.rng.uniform(-0.005, 0.005),
                 'address': f'地址{i}',
-                'rating': random.uniform(3.5, 5.0),
-                'cost': random.uniform(20, 50)
+                'rating': self.rng.uniform(3.5, 5.0),
+                'cost': self.rng.uniform(20, 50)
             })
         return locations
 
@@ -540,8 +541,8 @@ class LocationDataLoader:
         for i in range(50):
             locations.append({
                 'user_id': f'user_{i:04d}',
-                'latitude': 25.815 + random.uniform(-0.01, 0.01),
-                'longitude': 114.92 + random.uniform(-0.01, 0.01),
+                'latitude': 25.815 + self.rng.uniform(-0.01, 0.01),
+                'longitude': 114.92 + self.rng.uniform(-0.01, 0.01),
                 'type': 'user'
             })
         return locations
@@ -582,7 +583,8 @@ class LocationDataLoader:
         if not self.user_locations:
             return self._generate_random_grid_location()
 
-        user = random.choice(self.user_locations)
+        idx = int(self.rng.integers(0, len(self.user_locations)))
+        user = self.user_locations[idx]
         grid_loc = self.convert_to_grid_coordinates(
             user['longitude'],
             user['latitude']
@@ -592,8 +594,8 @@ class LocationDataLoader:
     def _generate_random_grid_location(self):
         """生成随机网格位置（备用）"""
         return (
-            random.uniform(0, self.grid_size - 1),
-            random.uniform(0, self.grid_size - 1)
+            self.rng.uniform(0, self.grid_size - 1),
+            self.rng.uniform(0, self.grid_size - 1)
         )
 
     def find_optimal_base_locations(self, num_bases, method='kmeans'):
@@ -620,7 +622,7 @@ class LocationDataLoader:
         # 添加用户位置（采样一部分避免过多）- 修复：按索引采样
         user_sample_size = min(100, len(self.user_locations))
         if len(self.user_locations) > 0 and user_sample_size > 0:
-            idx = np.random.choice(np.arange(len(self.user_locations)), size=user_sample_size, replace=False)
+            idx = self.rng.choice(np.arange(len(self.user_locations)), size=user_sample_size, replace=False)
             sampled_users = [self.user_locations[int(i)] for i in idx]
         else:
             sampled_users = []
@@ -635,8 +637,8 @@ class LocationDataLoader:
             # 如果位置数量不足，补充随机位置
             while len(all_locations) < num_bases:
                 all_locations.append((
-                    random.uniform(0, self.grid_size - 1),
-                    random.uniform(0, self.grid_size - 1)
+                    self.rng.uniform(0, self.grid_size - 1),
+                    self.rng.uniform(0, self.grid_size - 1)
                 ))
 
         # 转换为numpy数组
@@ -672,7 +674,7 @@ class LocationDataLoader:
         # 修复：按索引采样用户
         user_sample_size = min(200, len(self.user_locations))
         if len(self.user_locations) > 0 and user_sample_size > 0:
-            idx = np.random.choice(np.arange(len(self.user_locations)), size=user_sample_size, replace=False)
+            idx = self.rng.choice(np.arange(len(self.user_locations)), size=user_sample_size, replace=False)
             sampled_users = [self.user_locations[int(i)] for i in idx]
         else:
             sampled_users = []
@@ -708,8 +710,8 @@ class LocationDataLoader:
         base_locations = []
         for i in range(num_bases):
             base_locations.append((
-                random.uniform(0, self.grid_size - 1),
-                random.uniform(0, self.grid_size - 1)
+                self.rng.uniform(0, self.grid_size - 1),
+                self.rng.uniform(0, self.grid_size - 1)
             ))
         print(f"随机生成 {len(base_locations)} 个基站位置")
         return base_locations
@@ -804,16 +806,17 @@ class WeatherDataProcessor:
     def _create_fallback_weather_data(self):
         """创建备用天气数据"""
         print("使用备用天气数据")
+        _rng = np.random.default_rng(0)
         dates = pd.date_range(start='2006-01-01', end='2016-12-31', freq='h')
         data = {
             'Formatted Date': dates,
-            'Summary': np.random.choice(['Clear', 'Partly Cloudy', 'Cloudy', 'Rain', 'Windy', 'Fog'], len(dates)),
-            'Temperature (C)': np.random.normal(15, 10, len(dates)),
-            'Humidity': np.random.uniform(0.3, 0.9, len(dates)),
-            'Wind Speed (km/h)': np.random.exponential(10, len(dates)),
-            'Visibility (km)': np.random.uniform(5, 20, len(dates)),
-            'Pressure (millibars)': np.random.normal(1013, 10, len(dates)),
-            'Precip Type': np.random.choice(['rain', 'snow', 'none'], len(dates), p=[0.2, 0.05, 0.75])
+            'Summary': _rng.choice(['Clear', 'Partly Cloudy', 'Cloudy', 'Rain', 'Windy', 'Fog'], len(dates)),
+            'Temperature (C)': _rng.normal(15, 10, len(dates)),
+            'Humidity': _rng.uniform(0.3, 0.9, len(dates)),
+            'Wind Speed (km/h)': _rng.exponential(10, len(dates)),
+            'Visibility (km)': _rng.uniform(5, 20, len(dates)),
+            'Pressure (millibars)': _rng.normal(1013, 10, len(dates)),
+            'Precip Type': _rng.choice(['rain', 'snow', 'none'], len(dates), p=[0.2, 0.05, 0.75])
         }
         return pd.DataFrame(data)
 
@@ -846,6 +849,7 @@ class OrderDataProcessor:
         self.grid_size = grid_size
         self.merchant_ids = merchant_ids if merchant_ids else []
         self.num_merchants = len(merchant_ids) if merchant_ids else 5
+        self.rng = np.random.default_rng(0)
         self.order_df = self._load_order_data(excel_path)
         self.order_patterns = self._analyze_order_patterns()
         self.time_system = time_system  # 注入时间系统，供准备时间计算
@@ -862,15 +866,15 @@ class OrderDataProcessor:
                         df[col] = pd.date_range(start='2023-01-01', periods=len(df), freq='h')
                     elif col == 'merchant_id':
                         if self.merchant_ids:
-                            df[col] = np.random.choice(self.merchant_ids, len(df))
+                            df[col] = self.rng.choice(self.merchant_ids, len(df))
                         else:
-                            df[col] = np.random.randint(0, self.num_merchants, len(df))
+                            df[col] = self.rng.integers(0, self.num_merchants, len(df))
                     elif col == 'order_type':
-                        df[col] = np.random.choice([0, 1, 2], len(df), p=[0.8, 0.15, 0.05])
+                        df[col] = self.rng.choice([0, 1, 2], len(df), p=[0.8, 0.15, 0.05])
                     elif col == 'preparation_time':
-                        df[col] = np.random.randint(3, 10, len(df))
+                        df[col] = self.rng.integers(3, 10, len(df))
                     elif col == 'distance':
-                        df[col] = np.random.exponential(3, len(df))
+                        df[col] = self.rng.exponential(3, len(df))
             return df
         except Exception as e:
             print(f"加载订单数据失败: {e}")
@@ -882,12 +886,12 @@ class OrderDataProcessor:
         dates = pd.date_range(start='2023-01-01', end='2023-12-31', freq='h')
         data = {
             'order_time': dates,
-            'merchant_id': np.random.choice(self.merchant_ids, len(dates)) if self.merchant_ids else np.random.randint(
+            'merchant_id': self.rng.choice(self.merchant_ids, len(dates)) if self.merchant_ids else self.rng.integers(
                 0, self.num_merchants, len(dates)),
-            'order_type': np.random.choice([0, 1, 2], len(dates), p=[0.8, 0.15, 0.05]),
-            'preparation_time': np.random.randint(3, 10, len(dates)),
-            'distance': np.random.exponential(3, len(dates)),
-            'is_peak': np.random.choice([0, 1], len(dates), p=[0.7, 0.3])
+            'order_type': self.rng.choice([0, 1, 2], len(dates), p=[0.8, 0.15, 0.05]),
+            'preparation_time': self.rng.integers(3, 10, len(dates)),
+            'distance': self.rng.exponential(3, len(dates)),
+            'is_peak': self.rng.choice([0, 1], len(dates), p=[0.7, 0.3])
         }
         return pd.DataFrame(data)
 
@@ -1000,16 +1004,16 @@ class OrderDataProcessor:
     def generate_order_details(self, env_time, weather_type):
         """生成订单详细信息"""
         if self.merchant_ids:
-            merchant_id = np.random.choice(self.merchant_ids, p=self.order_patterns['merchant_distribution'])
+            merchant_id = self.rng.choice(self.merchant_ids, p=self.order_patterns['merchant_distribution'])
         else:
-            merchant_id = np.random.choice(range(self.num_merchants), p=self.order_patterns['merchant_distribution'])
+            merchant_id = self.rng.choice(range(self.num_merchants), p=self.order_patterns['merchant_distribution'])
 
-        order_type = np.random.choice([0, 1, 2], p=self.order_patterns['order_type_distribution'])
+        order_type = self.rng.choice([0, 1, 2], p=self.order_patterns['order_type_distribution'])
         self.current_order_type = order_type
 
         if weather_type in [WeatherType.RAINY, WeatherType.EXTREME]:
             order_type_weights = [0.6, 0.2, 0.2]
-            order_type = np.random.choice([0, 1, 2], p=order_type_weights)
+            order_type = self.rng.choice([0, 1, 2], p=order_type_weights)
 
         preparation_time = self._generate_preparation_time(weather_type)
         urgency = self._generate_urgency(env_time % 24)
@@ -1033,18 +1037,18 @@ class OrderDataProcessor:
 
         if hasattr(self, 'current_order_type'):
             if self.current_order_type == 0:
-                base_time_minutes = random.randint(1, 5)
+                base_time_minutes = int(self.rng.integers(1, 6))
             elif self.current_order_type == 1:
-                base_time_minutes = random.randint(2, 5)
+                base_time_minutes = int(self.rng.integers(2, 6))
             else:
-                base_time_minutes = random.randint(10, 20)
+                base_time_minutes = int(self.rng.integers(10, 21))
         else:
-            base_time_minutes = random.randint(5, 15)
+            base_time_minutes = int(self.rng.integers(5, 16))
 
         if weather_type == WeatherType.EXTREME:
-            base_time_minutes += random.randint(3, 8)
+            base_time_minutes += int(self.rng.integers(3, 9))
         elif weather_type == WeatherType.RAINY:
-            base_time_minutes += random.randint(1, 3)
+            base_time_minutes += int(self.rng.integers(1, 4))
 
         if hasattr(self, 'time_system') and self.time_system is not None:
             minutes_per_step = 60 // self.time_system.steps_per_hour
@@ -1113,6 +1117,9 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                  order_cutoff_steps: int = 0,  # Stop accepting orders this many steps before business end (0=disabled)
                  ):
         super().__init__()
+
+        # ====== 独立 RNG（由 reset(seed=...) 重置，隔离环境随机流）======
+        self.np_random = np.random.default_rng(0)
 
         # ====== 固定基础参数（init 一次性确定）======
 
@@ -1353,8 +1360,8 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
             base_location = self.locations.get(f'base_{i}')
             if base_location is None:
                 base_location = (
-                    random.uniform(0, self.grid_size - 1),
-                    random.uniform(0, self.grid_size - 1)
+                    self.np_random.uniform(0, self.grid_size - 1),
+                    self.np_random.uniform(0, self.grid_size - 1)
                 )
                 self.locations[f'base_{i}'] = base_location
 
@@ -1376,14 +1383,14 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
 
             business_type = merchant_data['business_type']
             if '饮料' in business_type or '奶茶' in business_type or '咖啡' in business_type:
-                preparation_efficiency = random.uniform(1.5, 2.0)
-                base_prep_time = random.randint(2, 4)
+                preparation_efficiency = self.np_random.uniform(1.5, 2.0)
+                base_prep_time = int(self.np_random.integers(2, 5))
             elif '快餐' in business_type or '小吃' in business_type:
-                preparation_efficiency = random.uniform(1.2, 1.5)
-                base_prep_time = random.randint(5, 8)
+                preparation_efficiency = self.np_random.uniform(1.2, 1.5)
+                base_prep_time = int(self.np_random.integers(5, 9))
             else:
-                preparation_efficiency = random.uniform(1.0, 1.3)
-                base_prep_time = random.randint(8, 12)
+                preparation_efficiency = self.np_random.uniform(1.0, 1.3)
+                base_prep_time = int(self.np_random.integers(8, 13))
 
             self.merchants[merchant_id] = {
                 'location': merchant_data['grid_location'],
@@ -1396,7 +1403,7 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                 'base_preparation_time': base_prep_time,
                 'efficiency': preparation_efficiency,
                 'order_count': 0,
-                'cancellation_rate': random.uniform(0.01, 0.03),
+                'cancellation_rate': self.np_random.uniform(0.01, 0.03),
                 'landing_zone': True
             }
 
@@ -1414,7 +1421,7 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                 'current_order': None,
                 'orders_completed': 0,
                 'speed': 3,
-                'reliability': random.uniform(0.95, 0.99),
+                'reliability': self.np_random.uniform(0.95, 0.99),
                 'max_capacity': self.drone_max_capacity,
                 'current_load': 0,
                 'battery_level': 100.0,
@@ -1666,7 +1673,11 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
     def reset(self, seed=None, options=None):
         """重置环境 - 开始新的一天"""
         if seed is not None:
-            set_global_seed(seed)
+            self.np_random = np.random.default_rng(seed)
+
+        # 将环境 RNG 传播给依赖子对象，确保随机流统一
+        self.location_loader.rng = self.np_random
+        self.order_processor.rng = self.np_random
 
         self.time_system.reset()
         self.daily_stats['day_number'] = self.time_system.day_number
@@ -1705,7 +1716,7 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         self._end_of_day_printed = False
         # ====== 多目标权重：每个 episode 一个偏好 ======
         if self.multi_objective_mode == "conditioned":
-            w = np.random.dirichlet(alpha=np.ones(self.num_objectives)).astype(np.float32)
+            w = self.np_random.dirichlet(alpha=np.ones(self.num_objectives)).astype(np.float32)
             self.objective_weights = w
         else:
             self.objective_weights = self.fixed_objective_weights.copy()
@@ -1887,15 +1898,15 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                 'status': DroneStatus.IDLE,
                 'current_order': None,
                 'orders_completed': 0,
-                'speed': random.uniform(3.0, 5.0),
-                'reliability': random.uniform(0.95, 0.99),
+                'speed': self.np_random.uniform(3.0, 5.0),
+                'reliability': self.np_random.uniform(0.95, 0.99),
                 'max_capacity': self.drone_max_capacity,
                 'current_load': 0,
                 'battery_level': 100.0,
                 'max_battery': 100.0,
-                'battery_consumption_rate': random.uniform(0.2, 0.4),
-                'charging_rate': random.uniform(10.0, 15.0),
-                'cancellation_rate': random.uniform(0.005, 0.015),
+                'battery_consumption_rate': self.np_random.uniform(0.2, 0.4),
+                'charging_rate': self.np_random.uniform(10.0, 15.0),
+                'cancellation_rate': self.np_random.uniform(0.005, 0.015),
                 'total_distance_today': 0.0,
             }
             self.drones[i]['planned_stops'] = deque()
@@ -1932,7 +1943,7 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         """生成早晨初始订单"""
         morning_prob = 0.5
         for _ in range(5):
-            if random.random() < morning_prob:
+            if self.np_random.random() < morning_prob:
                 self._generate_single_order()
 
     # ------------------ trip distance helpers ------------------
@@ -3873,19 +3884,19 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
             order = self.orders[order_id]
 
             if (order['status'] in [OrderStatus.PENDING, OrderStatus.ACCEPTED] and
-                    random.random() < 0.02 * cancellation_factor):
+                    self.np_random.random() < 0.02 * cancellation_factor):
                 self._cancel_order(order_id, "user_cancellation")
 
             elif (order['status'] == OrderStatus.ACCEPTED and
-                  random.random() < self.merchants[order['merchant_id']]['cancellation_rate']):
+                  self.np_random.random() < self.merchants[order['merchant_id']]['cancellation_rate']):
                 self._cancel_order(order_id, "merchant_cancellation")
 
             elif (order['status'] == OrderStatus.ASSIGNED and
-                  random.random() < self.drones[order['assigned_drone']]['cancellation_rate'] * cancellation_factor):
+                  self.np_random.random() < self.drones[order['assigned_drone']]['cancellation_rate'] * cancellation_factor):
                 self._cancel_order(order_id, "drone_cancellation")
 
             elif (order['status'] in [OrderStatus.ACCEPTED, OrderStatus.ASSIGNED] and
-                  random.random() < 0.01):
+                  self.np_random.random() < 0.01):
                 self._change_order_address(order_id)
 
     def _get_weather_cancellation_factor(self):
@@ -3990,18 +4001,18 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
             weather_type=self.weather
         )
 
-        if random.random() < order_prob:
+        if self.np_random.random() < order_prob:
             if order_prob > 0.8:
-                base_batch = random.randint(3, 6)
+                base_batch = int(self.np_random.integers(3, 7))
             elif order_prob > 0.5:
-                base_batch = random.randint(2, 4)
+                base_batch = int(self.np_random.integers(2, 5))
             else:
-                base_batch = random.randint(1, 2)
+                base_batch = int(self.np_random.integers(1, 3))
 
             batch_size = int(base_batch * self.high_load_factor)
 
             if time_state['is_peak_hour']:
-                batch_size += random.randint(1, 3)
+                batch_size += int(self.np_random.integers(1, 4))
 
             for _ in range(batch_size):
                 self._generate_single_order()
@@ -4015,7 +4026,7 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
             order_details = self.order_processor.generate_order_details(env_time, self.weather)
 
             if order_details['merchant_id'] not in self.merchant_ids:
-                order_details['merchant_id'] = random.choice(self.merchant_ids)
+                order_details['merchant_id'] = self.merchant_ids[int(self.np_random.integers(0, len(self.merchant_ids)))]
 
             self._generate_order_with_details(order_details, order_id)
 
@@ -4026,17 +4037,17 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         try:
             merchant_id = order_details['merchant_id']
             if merchant_id not in self.merchants:
-                merchant_id = random.choice(self.merchant_ids)
+                merchant_id = self.merchant_ids[int(self.np_random.integers(0, len(self.merchant_ids)))]
 
             merchant_loc = self.merchants[merchant_id]['location']
             max_distance = order_details['max_distance']
             customer_loc = self._generate_customer_location(merchant_loc, max_distance)
 
-            if random.random() < 0.3:
+            if self.np_random.random() < 0.3:
                 customer_loc = self._generate_distant_location(merchant_loc)
 
             weather_summary = self.weather_details.get('summary', 'Unknown')
-            preparation_time = int(order_details.get('preparation_time', random.randint(2, 6)))
+            preparation_time = int(order_details.get('preparation_time', int(self.np_random.integers(2, 7))))
 
             order = {
                 'id': order_id,
@@ -4049,7 +4060,7 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                 'creation_step': self.time_system.current_step,  # explicit step-coordinate field for SC/GC stats
                 'assigned_drone': -1,
                 'preparation_time': preparation_time,  # step
-                'urgent': random.random() < order_details['urgency'],
+                'urgent': self.np_random.random() < order_details['urgency'],
                 'weather_conditions': weather_summary
             }
 
@@ -4076,15 +4087,16 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
 
     def _generate_distant_location(self, merchant_loc):
         merchant_x, merchant_y = merchant_loc
-        edge = random.choice(['top', 'bottom', 'left', 'right'])
+        edges = ['top', 'bottom', 'left', 'right']
+        edge = edges[int(self.np_random.integers(0, len(edges)))]
         if edge == 'top':
-            return random.uniform(0, self.grid_size - 1), self.grid_size - 1
+            return self.np_random.uniform(0, self.grid_size - 1), self.grid_size - 1
         elif edge == 'bottom':
-            return random.uniform(0, self.grid_size - 1), 0
+            return self.np_random.uniform(0, self.grid_size - 1), 0
         elif edge == 'left':
-            return 0, random.uniform(0, self.grid_size - 1)
+            return 0, self.np_random.uniform(0, self.grid_size - 1)
         else:
-            return self.grid_size - 1, random.uniform(0, self.grid_size - 1)
+            return self.grid_size - 1, self.np_random.uniform(0, self.grid_size - 1)
 
     def _generate_customer_location(self, merchant_loc, max_distance):
         for _ in range(10):
@@ -4095,8 +4107,8 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
 
         merchant_x, merchant_y = merchant_loc
         return (
-            max(0, min(self.grid_size - 1, merchant_x + random.randint(-2, 2))),
-            max(0, min(self.grid_size - 1, merchant_y + random.randint(-2, 2)))
+            max(0, min(self.grid_size - 1, merchant_x + int(self.np_random.integers(-2, 3)))),
+            max(0, min(self.grid_size - 1, merchant_y + int(self.np_random.integers(-2, 3))))
         )
 
     def _calculate_euclidean_distance(self, loc1, loc2):

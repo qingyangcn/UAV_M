@@ -139,8 +139,6 @@ def run_single_episode(args, order_cutoff_steps: int, seed: int) -> dict:
     generation stops K steps before business-end (Mode 1).  Delivery of
     already-accepted orders continues until the episode finishes.
     """
-    np.random.seed(seed)
-
     env = _make_env(args, order_cutoff_steps=order_cutoff_steps)
 
     if _HAS_MOPSO:
@@ -163,7 +161,7 @@ def run_single_episode(args, order_cutoff_steps: int, seed: int) -> dict:
         verbose=False,
     )
 
-    executor.run_episode(max_steps=args.max_steps)
+    executor.run_episode(max_steps=args.max_steps, seed=seed)
 
     stats = _compute_completion_stats(env)
     stats['order_cutoff_steps'] = order_cutoff_steps
@@ -284,7 +282,7 @@ def run_sanity_check(args):
     print(f"Running episode (max {args.max_steps} decision steps)...")
     print("=" * 80 + "\n")
 
-    stats = executor.run_episode(max_steps=args.max_steps)
+    stats = executor.run_episode(max_steps=args.max_steps, seed=args.seed)
 
     # Print results
     print("\n" + "=" * 80)
@@ -400,9 +398,6 @@ def main():
             traceback.print_exc()
             sys.exit(1)
     else:
-        # Set random seed for single run
-        np.random.seed(args.seed)
-
         # Run sanity check
         try:
             run_sanity_check(args)
