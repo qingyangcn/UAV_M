@@ -4,21 +4,25 @@ Baseline: Random Rule Selection
 Implements a random policy baseline that selects rule_id uniformly at random
 from {0, 1, 2, 3, 4} at each decision point.
 
+K (order_cutoff_steps) — Mode 1:
+    The environment stops generating/accepting new orders K steps before the
+    business-end step, but continues delivering already-accepted orders until
+    the episode finishes.  K=0 means no early cutoff.
+
 Compatible with DecentralizedEventDrivenExecutor.
 
 Usage:
     # Run single episode
     python baseline_random.py --seed 42
 
+    # Run with early order cutoff (K=19)
+    python baseline_random.py --seed 42 --order-cutoff-steps 19
+
     # Run multiple seeds
     python baseline_random.py --seeds 42,43,44
-
-    # Run without MOPSO candidate generation
-    python baseline_random.py --seed 42 --no-mopso
 """
 
 import argparse
-import math
 import os
 import sys
 
@@ -46,7 +50,7 @@ def run_episode(args, seed: int) -> dict:
     """Run one episode with random policy and return completion stats."""
     np.random.seed(seed)
 
-    env = _make_env(args, order_cutoff_steps=0)
+    env = _make_env(args, order_cutoff_steps=args.order_cutoff_steps)
 
     if args.use_mopso and _HAS_MOPSO:
         candidate_generator = MOPSOCandidateGenerator(
@@ -68,7 +72,7 @@ def run_episode(args, seed: int) -> dict:
 
     executor.run_episode(max_steps=args.max_steps)
 
-    stats = _compute_completion_stats(env, sc_cutoff_steps=args.candidate_k)
+    stats = _compute_completion_stats(env)
     stats['seed'] = seed
     stats['policy'] = 'random'
     return stats
@@ -76,15 +80,10 @@ def run_episode(args, seed: int) -> dict:
 
 def print_stats(stats: dict):
     """Print completion statistics in a standard format."""
-    sc = stats['serviceable_completion']
-    sc_str = f"{sc:.4f}" if not math.isnan(sc) else "nan"
     print(f"  seed={stats['seed']}  "
           f"generated_total={stats['generated_total']}  "
           f"completed_total={stats['completed_total']}  "
-          f"general_completion={stats['general_completion']:.4f}  "
-          f"serviceable_generated={stats['serviceable_generated']}  "
-          f"serviceable_completed={stats['serviceable_completed']}  "
-          f"serviceable_completion={sc_str}")
+          f"general_completion={stats['general_completion']:.4f}")
 
 
 def main():
@@ -105,8 +104,9 @@ def main():
                         help="Top K merchants (default: 100)")
     parser.add_argument("--candidate-k", type=int, default=20,
                         help="Number of candidates per drone")
-    parser.add_argument("--cutoff-values", type=str, default="0",
-                        help="Comma-separated K values to sweep in ablation mode (default: 0,6,12,18,24)")
+    parser.add_argument("--order-cutoff-steps", type=int, default=0,
+                        help="Stop generating/accepting orders this many steps before "
+                             "business end (K, Mode 1; default: 0=disabled)")
     parser.add_argument("--enable-random-events", action="store_true", default=False,
                         help="Enable random events (default: False)")
     parser.add_argument("--max-skip-steps", type=int, default=1,
@@ -137,12 +137,8 @@ def main():
 
     if len(all_stats) > 1:
         gc_values = [s['general_completion'] for s in all_stats]
-        sc_values = [s['serviceable_completion'] for s in all_stats
-                     if not math.isnan(s['serviceable_completion'])]
         print("-" * 80)
-        print(f"  mean_general_completion={float(np.mean(gc_values)):.4f}  "
-              f"mean_serviceable_completion="
-              f"{float(np.mean(sc_values)):.4f if sc_values else 'nan'}")
+        print(f"  mean_general_completion={float(np.mean(gc_values)):.4f}")
 
     print("=" * 80)
     return all_stats
