@@ -139,8 +139,6 @@ def run_single_episode(args, order_cutoff_steps: int, seed: int) -> dict:
     generation stops K steps before business-end (Mode 1).  Delivery of
     already-accepted orders continues until the episode finishes.
     """
-    np.random.seed(seed)
-
     env = _make_env(args, order_cutoff_steps=order_cutoff_steps)
 
     if _HAS_MOPSO:
@@ -163,7 +161,7 @@ def run_single_episode(args, order_cutoff_steps: int, seed: int) -> dict:
         verbose=False,
     )
 
-    executor.run_episode(max_steps=args.max_steps)
+    executor.run_episode(max_steps=args.max_steps, seed=seed)
 
     stats = _compute_completion_stats(env)
     stats['order_cutoff_steps'] = order_cutoff_steps
@@ -284,8 +282,8 @@ def run_sanity_check(args):
     print(f"Running episode (max {args.max_steps} decision steps)...")
     print("=" * 80 + "\n")
 
-    stats = executor.run_episode(max_steps=args.max_steps)
-
+    stats = executor.run_episode(max_steps=args.max_steps, seed=args.seed)
+    '''
     # Print results
     print("\n" + "=" * 80)
     print("Sanity Check Results")
@@ -330,7 +328,7 @@ def run_sanity_check(args):
         print("  This might indicate issues with order availability or drone capacity.")
 
     print("\n" + "=" * 80)
-
+    '''
 
 def main():
     """Parse arguments and run sanity check."""
@@ -367,12 +365,10 @@ def main():
                         help="Stop accepting orders this many steps before business end (default: 0=disabled)")
 
     # Ablation parameters
-    parser.add_argument("--ablation-cutoff", action="store_true", default=True,
+    parser.add_argument("--ablation-cutoff", action="store_true", default=False,
                         help="Enable K-sweep ablation mode: scan environment order_cutoff_steps "
                              "(stops order generation K steps before business end)")
-    parser.add_argument("--cutoff-values", type=str, default="0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,"
-                                                             "21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,"
-                                                             "41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60",
+    parser.add_argument("--cutoff-values", type=str, default="0",
                         help="Comma-separated environment order_cutoff_steps (K) values to sweep "
                              "in ablation mode (default: 0..60)")
     parser.add_argument("--seeds", type=str, default="21",
@@ -381,7 +377,7 @@ def main():
                         help="Output CSV path for ablation results")
 
     # Other parameters
-    parser.add_argument("--seed", type=int, default=42,
+    parser.add_argument("--seed", type=int, default=21,
                         help="Random seed (default: 42)")
     parser.add_argument("--verbose", action="store_true", default=False,
                         help="Print detailed execution logs (default: False)")
@@ -400,9 +396,6 @@ def main():
             traceback.print_exc()
             sys.exit(1)
     else:
-        # Set random seed for single run
-        np.random.seed(args.seed)
-
         # Run sanity check
         try:
             run_sanity_check(args)
