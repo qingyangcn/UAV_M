@@ -53,26 +53,68 @@ def load_trained_policy(model_path: str, vecnormalize_path: str = None):
     """
     try:
         from stable_baselines3 import PPO
-        from stable_baselines3.common.vec_env import VecNormalize
     except ImportError:
         raise RuntimeError("Please install stable-baselines3: pip install stable-baselines3")
 
     # Load model
     model = PPO.load(model_path)
 
-    # Load VecNormalize stats if provided
-    vec_normalize = None
+    # Load VecNormalize stats if provided and apply during inference
+    obs_rms = None
+    clip_obs = 10.0
+    epsilon = 1e-8
+
     if vecnormalize_path and os.path.exists(vecnormalize_path):
-        print(f"Loading VecNormalize stats from: {vecnormalize_path}")
-        # Note: VecNormalize needs a dummy env to load
-        # For now, we'll skip normalization in evaluation
-        print("Warning: VecNormalize stats loading not implemented in sanity check")
+        try:
+            try:
+                import cloudpickle as _pkl_mod
+            except ImportError:
+                import pickle as _pkl_mod
+            with open(vecnormalize_path, 'rb') as f:
+                _vn = _pkl_mod.load(f)
+            _obs_rms = getattr(_vn, 'obs_rms', None)
+            _clip_obs = float(getattr(_vn, 'clip_obs', 10.0))
+            _norm_obs = bool(getattr(_vn, 'norm_obs', True))
+            _epsilon = float(getattr(_vn, 'epsilon', 1e-8))
+            if _norm_obs and _obs_rms:
+                obs_rms = _obs_rms
+                clip_obs = _clip_obs
+                epsilon = _epsilon
+                print(f"VecNormalize stats loaded from: {vecnormalize_path}")
+                print(f"  norm_obs enabled, clip_obs={clip_obs}")
+                for key, rms in obs_rms.items():
+                    _mean_avg = float(np.array(rms.mean).mean())
+                    _std_avg = float(np.sqrt(np.array(rms.var).mean()))
+                    print(f"  obs_rms['{key}']: mean_avg={_mean_avg:.4f}, std_avg={_std_avg:.4f}")
+            else:
+                print(f"VecNormalize loaded from: {vecnormalize_path} "
+                      f"(norm_obs={_norm_obs}, no normalization applied)")
+        except Exception as e:
+            print(f"Warning: Failed to load VecNormalize stats from {vecnormalize_path}: {e}")
+            print("  Proceeding without observation normalization.")
+    elif vecnormalize_path:
+        print(f"Warning: VecNormalize stats file not found: {vecnormalize_path}")
+        print("  Proceeding without observation normalization.")
 
     def policy_fn(local_obs: dict) -> int:
         """Wrapper function for trained policy."""
-        # Convert dict obs to format expected by model
-        # Model expects dict with keys: drone_state, candidates, global_context
-        action, _ = model.predict(local_obs, deterministic=True)
+        if obs_rms is not None:
+            # Apply VecNormalize observation normalization to match training preprocessing.
+            # Replicates VecNormalize._normalize_obs: clip((obs - mean) / sqrt(var + eps), ±clip_obs)
+            normalized = {}
+            for key, obs in local_obs.items():
+                if key in obs_rms:
+                    rms = obs_rms[key]
+                    normalized[key] = np.clip(
+                        (obs - rms.mean) / np.sqrt(rms.var + epsilon),
+                        -clip_obs, clip_obs,
+                    ).astype(np.float32)
+                else:
+                    normalized[key] = obs
+            obs_to_predict = normalized
+        else:
+            obs_to_predict = local_obs
+        action, _ = model.predict(obs_to_predict, deterministic=True)
         return int(action)
 
     return policy_fn
