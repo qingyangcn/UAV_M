@@ -31,7 +31,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from UAV_ENVIRONMENT_11 import ThreeObjectiveDroneDeliveryEnv
 from U10_candidate_generator import MOPSOCandidateGenerator
 from U11_decentralized_execution import DecentralizedEventDrivenExecutor
-
+import numpy as np, random
+np.random.seed(42)
+random.seed(42)
 
 def random_policy(local_obs: dict) -> int:
     """Simple random policy for testing."""
@@ -172,8 +174,6 @@ def run_sanity_check(args):
         for reason, count in sorted(stats['failure_reasons'].items(),
                                     key=lambda x: -x[1]):
             print(f"  {reason}: {count}")
-
-
 
     if stats['total_decisions'] == 0:
         print("\n⚠ WARNING: No decisions were made during the episode!")
