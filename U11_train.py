@@ -57,7 +57,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
-from typing import Optional
+from typing import List, Optional
 
 import numpy as np
 import gymnasium as gym
@@ -69,6 +69,145 @@ from UAV_ENVIRONMENT_11 import ThreeObjectiveDroneDeliveryEnv
 from U10_candidate_generator import MOPSOCandidateGenerator
 from U10_event_driven_single_uav_wrapper import EventDrivenSingleUAVWrapper
 from U11_single_uav_training_wrapper import SingleUAVTrainingWrapper
+
+
+class HighLoadSamplingWrapper(gym.Wrapper):
+    """Gymnasium wrapper that randomizes high_load_factor at the start of each episode.
+
+    Supports three sampling modes:
+
+    * ``'fixed'``      – Use a single fixed high_load_factor (no-op; backward-compatible).
+    * ``'random'``     – Uniformly sample from *high_load_factors* at every reset.
+    * ``'curriculum'`` – Linearly expand the sampling pool from the minimum value to
+                         the maximum value over *curriculum_total_episodes* episodes.
+
+    The selected value is injected into the underlying
+    :class:`ThreeObjectiveDroneDeliveryEnv` via its
+    :meth:`~ThreeObjectiveDroneDeliveryEnv.set_high_load_factor` method **before**
+    each episode reset so that morning-order generation already uses it.
+
+    The current ``high_load_factor`` is also appended to every ``info`` dict
+    returned by :meth:`step` so that SB3 callbacks can log it.
+
+    Args:
+        env: Wrapped environment.  Must expose a
+            :class:`ThreeObjectiveDroneDeliveryEnv` via ``env.unwrapped``.
+        high_load_factors: List of factor values to sample from.
+        sampling: Sampling mode (``'fixed'``, ``'random'``, or ``'curriculum'``).
+        seed: Seed for the internal sampling RNG (independent of the env seed).
+        curriculum_total_episodes: Number of episodes over which to expand the
+            curriculum range from min to max.  After this many episodes the full
+            range is always used.
+    """
+
+    def __init__(
+            self,
+            env: gym.Env,
+            high_load_factors: List[float],
+            sampling: str = 'random',
+            seed: int = 42,
+            curriculum_total_episodes: int = 10000,
+    ):
+        super().__init__(env)
+        self.high_load_factors = sorted(float(h) for h in high_load_factors)
+        self.sampling = sampling
+        self._rng = np.random.default_rng(seed)
+        self.curriculum_total_episodes = int(curriculum_total_episodes)
+        self._episode_count: int = 0
+        # Initialise to the first (smallest) factor
+        self._current_high: float = self.high_load_factors[0]
+
+    def reset(self, **kwargs):
+        """Sample a new high_load_factor then reset the underlying environment."""
+        if self.sampling == 'random':
+            self._current_high = float(self._rng.choice(self.high_load_factors))
+        elif self.sampling == 'curriculum':
+            progress = min(1.0, self._episode_count / max(1, self.curriculum_total_episodes))
+            min_h = self.high_load_factors[0]
+            max_h = self.high_load_factors[-1]
+            current_upper = min_h + progress * (max_h - min_h)
+            valid = [h for h in self.high_load_factors if h <= current_upper + 1e-9]
+            if not valid:
+                valid = [self.high_load_factors[0]]
+            self._current_high = float(self._rng.choice(valid))
+        # 'fixed' mode: self._current_high stays as initialised
+
+        # Inject into base environment BEFORE reset so _generate_morning_orders uses it
+        self.env.unwrapped.set_high_load_factor(self._current_high)
+
+        obs, info = self.env.reset(**kwargs)
+        info['high_load_factor'] = self._current_high
+        self._episode_count += 1
+        return obs, info
+
+    def step(self, action):
+        """Propagate high_load_factor into the info dict on every step."""
+        obs, reward, terminated, truncated, info = self.env.step(action)
+        info['high_load_factor'] = self._current_high
+        return obs, reward, terminated, truncated, info
+
+
+class HighLoadLoggingCallback:
+    """SB3 callback that logs ``high_load_factor`` statistics per episode.
+
+    Reads the ``'high_load_factor'`` key injected by
+    :class:`HighLoadSamplingWrapper` into the info dict and records it to the
+    SB3 logger (TensorBoard / CSV).  Every *log_interval* completed episodes it
+    also prints a compact distribution summary to stdout.
+
+    Args:
+        log_interval: Print distribution stats to stdout every N episodes.
+        verbose: Verbosity level (passed to :class:`~stable_baselines3.common.callbacks.BaseCallback`).
+    """
+
+    def __new__(cls, log_interval: int = 10, verbose: int = 0):
+        # Lazily import BaseCallback so the module stays importable even without SB3
+        try:
+            from stable_baselines3.common.callbacks import BaseCallback
+        except ImportError:
+            raise RuntimeError(
+                "stable_baselines3 is required to use HighLoadLoggingCallback. "
+                "Install it with: pip install stable-baselines3"
+            )
+
+        class _Impl(BaseCallback):
+            def __init__(self, _log_interval: int, _verbose: int):
+                super().__init__(_verbose)
+                self.log_interval = _log_interval
+                self._episode_highs: list = []
+                self._total_episodes: int = 0
+
+            def _on_step(self) -> bool:
+                dones = self.locals.get('dones', [])
+                infos = self.locals.get('infos', [])
+                for done, info in zip(dones, infos):
+                    if done:
+                        high = info.get('high_load_factor')
+                        if high is not None:
+                            high = float(high)
+                            self._episode_highs.append(high)
+                            self._total_episodes += 1
+                            self.logger.record(
+                                'train/episode_high_load_factor', high
+                            )
+                            if self._total_episodes % self.log_interval == 0:
+                                window = self._episode_highs[-self.log_interval:]
+                                arr = np.array(window, dtype=np.float32)
+                                counts = {
+                                    float(h): int((arr == h).sum())
+                                    for h in np.unique(arr)
+                                }
+                                print(
+                                    f"\n[HighLoad @ep {self._total_episodes}] "
+                                    f"last {self.log_interval} eps — "
+                                    f"mean={arr.mean():.3f}, "
+                                    f"min={arr.min():.3f}, "
+                                    f"max={arr.max():.3f}, "
+                                    f"counts={dict(sorted(counts.items()))}"
+                                )
+                return True
+
+        return _Impl(log_interval, verbose)
 
 
 def make_env(
@@ -93,6 +232,10 @@ def make_env(
         diagnostics_interval: int,
         training_mode: str = 'event_driven_shared_policy',
         drone_sampling: str = 'random',
+        high_load_factor: float = 1.7,
+        high_load_factors: Optional[List[float]] = None,
+        high_load_sampling: str = 'fixed',
+        curriculum_total_episodes: int = 10000,
 ) -> gym.Env:
     """
     Create U10 environment with MOPSO candidate generation and event-driven wrapper.
@@ -119,6 +262,19 @@ def make_env(
         diagnostics_interval: Diagnostics print interval
         training_mode: Training mode ('event_driven_shared_policy' or 'central_queue')
         drone_sampling: Drone sampling strategy ('random' or 'round_robin')
+        high_load_factor: Fixed high_load_factor used when high_load_sampling='fixed'
+            (default: 1.7).  Ignored when high_load_sampling is 'random' or
+            'curriculum'.
+        high_load_factors: List of high_load_factor values for domain randomization
+            or curriculum training.  When None (default) and high_load_sampling is
+            not 'fixed', falls back to [high_load_factor].
+        high_load_sampling: Sampling strategy for high_load_factor per episode.
+            - 'fixed'      (default): always use *high_load_factor*.
+            - 'random':    uniformly sample from *high_load_factors* each episode.
+            - 'curriculum': linearly expand sampling pool over
+              *curriculum_total_episodes* episodes.
+        curriculum_total_episodes: Number of episodes for the curriculum range
+            expansion (only used when high_load_sampling='curriculum').
 
     Returns:
         Wrapped environment ready for training
@@ -146,6 +302,7 @@ def make_env(
         multi_objective_mode="fixed",
         candidate_update_interval=candidate_update_interval,
         candidate_fallback_enabled=False,  # Strict candidate filtering
+        high_load_factor=high_load_factor,
     )
 
     # Create MOPSO candidate generator
@@ -192,6 +349,17 @@ def make_env(
             f"Must be 'event_driven_shared_policy' or 'central_queue'"
         )
 
+    # Optionally wrap with domain-randomization / curriculum sampler
+    if high_load_sampling != 'fixed':
+        factors = high_load_factors if high_load_factors else [high_load_factor]
+        env = HighLoadSamplingWrapper(
+            env,
+            high_load_factors=factors,
+            sampling=high_load_sampling,
+            seed=seed,
+            curriculum_total_episodes=curriculum_total_episodes,
+        )
+
     return env
 
 
@@ -210,6 +378,11 @@ def train(args):
     if args.log_dir is not None:
         os.makedirs(args.log_dir, exist_ok=True)
     os.makedirs(args.model_dir, exist_ok=True)
+
+    # Parse high_load_factors list from args
+    high_load_factors: Optional[List[float]] = None
+    if args.high_load_factors:
+        high_load_factors = [float(v.strip()) for v in args.high_load_factors.split(',')]
 
     # Environment factory
     def env_fn():
@@ -235,6 +408,10 @@ def train(args):
             diagnostics_interval=args.diagnostics_interval,
             training_mode=args.training_mode,
             drone_sampling=args.drone_sampling,
+            high_load_factor=args.high_load_factor,
+            high_load_factors=high_load_factors,
+            high_load_sampling=args.high_load_sampling,
+            curriculum_total_episodes=args.curriculum_total_episodes,
         )
 
     # Create vectorized environment
@@ -273,6 +450,15 @@ def train(args):
     print(f"  top_k_merchants={args.top_k_merchants}, candidate_k={args.candidate_k}")
     print(f"  rule_count={args.rule_count} (Discrete action space)")
     print(f"  candidate_update_interval={args.candidate_update_interval}")
+    print(f"\nHigh Load Factor:")
+    if args.high_load_sampling == 'fixed':
+        print(f"  Mode: fixed  →  high_load_factor={args.high_load_factor:.2f}")
+    else:
+        _displayed_factors = high_load_factors if high_load_factors else [args.high_load_factor]
+        print(f"  Mode: {args.high_load_sampling}")
+        print(f"  Factors: {_displayed_factors}")
+        if args.high_load_sampling == 'curriculum':
+            print(f"  curriculum_total_episodes={args.curriculum_total_episodes}")
     print(f"\nUpper Layer (Candidate Generation):")
     print(f"  Method: MOPSOCandidateGenerator")
     print(f"  MOPSO: particles={args.mopso_n_particles}, iterations={args.mopso_n_iterations}")
@@ -324,10 +510,21 @@ def train(args):
         save_vecnormalize=True,
     )
 
+    # Build callback list
+    callbacks = [checkpoint_callback]
+    if args.high_load_sampling != 'fixed':
+        callbacks.append(
+            HighLoadLoggingCallback(
+                log_interval=args.high_load_log_interval,
+                verbose=0,
+            )
+        )
+
     # Train
+    from stable_baselines3.common.callbacks import CallbackList
     model.learn(
         total_timesteps=args.total_steps,
-        callback=checkpoint_callback,
+        callback=CallbackList(callbacks),
         progress_bar=True,
     )
 
@@ -380,6 +577,30 @@ def main():
                         help="Enable random events (default: False)")
     parser.add_argument("--debug-state-warnings", action="store_true", default=False,
                         help="Enable debug state warnings (default: False)")
+
+    # High load factor / domain randomization
+    parser.add_argument("--high-load-factor", type=float, default=1.7,
+                        help="Fixed high_load_factor used when --high-load-sampling=fixed "
+                             "(default: 1.7).  Sets the order generation intensity multiplier.")
+    parser.add_argument("--high-load-factors", type=str, default=None,
+                        help="Comma-separated list of high_load_factor values for domain "
+                             "randomization or curriculum training, e.g. '1.3,1.4,1.5,1.6,1.7,1.8'. "
+                             "Required when --high-load-sampling is 'random' or 'curriculum'.")
+    parser.add_argument("--high-load-sampling", type=str, default='fixed',
+                        choices=['fixed', 'random', 'curriculum'],
+                        help="Sampling strategy for high_load_factor per episode: "
+                             "'fixed' (default) – always use --high-load-factor; "
+                             "'random' – uniformly sample from --high-load-factors each episode; "
+                             "'curriculum' – linearly expand sampling pool from min to max over "
+                             "--curriculum-total-episodes episodes.")
+    parser.add_argument("--curriculum-total-episodes", type=int, default=10000,
+                        help="Number of episodes over which to expand the curriculum range from "
+                             "min to max high_load_factor (only used with "
+                             "--high-load-sampling=curriculum, default: 10000).")
+    parser.add_argument("--high-load-log-interval", type=int, default=10,
+                        help="Print high_load_factor distribution stats to stdout every N "
+                             "completed episodes (default: 10, only active when "
+                             "--high-load-sampling != fixed).")
 
     # Wrapper parameters
     parser.add_argument("--max-skip-steps", type=int, default=10,
