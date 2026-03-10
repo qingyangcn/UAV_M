@@ -1081,7 +1081,7 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                  base_placement_method='kmeans',
                  drone_max_capacity=10,
                  operating_hours=(6, 22),
-                 high_load_factor=1.8,
+                 high_load_factor=1.7,
                  distance_reward_weight=1.0,
                  multi_objective_mode: str = "conditioned",
                  fixed_objective_weights=(0.5, 0.3, 0.2),
@@ -2667,7 +2667,7 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
 
         # obj0：吞吐/效率
         completed_reward = float(delta_completed) * 2.0
-        cancelled_penalty_obj0 = float(delta_cancelled) * 1.0
+        cancelled_penalty_obj0 = float(delta_cancelled) * 2.0
         rewards[0] += completed_reward
         rewards[0] -= cancelled_penalty_obj0
 
@@ -2679,9 +2679,9 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
 
         # obj2：服务质量
         on_time_reward = float(delta_on_time) * 1.5
-        cancelled_penalty_obj2 = float(delta_cancelled) * 0.5
+        cancelled_penalty_obj2 = float(delta_cancelled) * 1.0
         backlog = len(self.active_orders)
-        backlog_penalty = float(backlog) * 0.005
+        backlog_penalty = float(backlog) * 0.05
         rewards[2] += on_time_reward
         rewards[2] -= cancelled_penalty_obj2
         rewards[2] -= backlog_penalty
