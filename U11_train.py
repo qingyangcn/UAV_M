@@ -135,7 +135,7 @@ def make_env(
         reward_output_mode="scalar",  # IMPORTANT: PPO requires scalar rewards
         enable_random_events=enable_random_events,
         debug_state_warnings=debug_state_warnings,
-        fixed_objective_weights=(0.5, 0.3, 0.2),
+        fixed_objective_weights=(0.3, 0.2, 0.5),
         num_candidates=candidate_k,
         rule_count=rule_count,
         enable_diagnostics=enable_diagnostics,
