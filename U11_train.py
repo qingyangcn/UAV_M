@@ -109,6 +109,11 @@ class HighLoadSamplingWrapper(gym.Wrapper):
             curriculum_total_episodes: int = 10000,
     ):
         super().__init__(env)
+        if curriculum_total_episodes <= 0:
+            raise ValueError(
+                f"curriculum_total_episodes must be a positive integer, "
+                f"got {curriculum_total_episodes}"
+            )
         self.high_load_factors = sorted(float(h) for h in high_load_factors)
         self.sampling = sampling
         self._rng = np.random.default_rng(seed)
@@ -117,16 +122,23 @@ class HighLoadSamplingWrapper(gym.Wrapper):
         # Initialise to the first (smallest) factor
         self._current_high: float = self.high_load_factors[0]
 
+    # Tolerance used when comparing float high_load_factor values to the
+    # linearly-expanding curriculum upper bound, to avoid rounding-error exclusions.
+    _CURRICULUM_FLOAT_TOL: float = 1e-9
+
     def reset(self, **kwargs):
         """Sample a new high_load_factor then reset the underlying environment."""
+        # Increment episode counter first so curriculum progress is 1-based
+        # (episode 1 → progress = 1/total, last episode → progress ≥ 1.0).
+        self._episode_count += 1
         if self.sampling == 'random':
             self._current_high = float(self._rng.choice(self.high_load_factors))
         elif self.sampling == 'curriculum':
-            progress = min(1.0, self._episode_count / max(1, self.curriculum_total_episodes))
+            progress = min(1.0, self._episode_count / self.curriculum_total_episodes)
             min_h = self.high_load_factors[0]
             max_h = self.high_load_factors[-1]
             current_upper = min_h + progress * (max_h - min_h)
-            valid = [h for h in self.high_load_factors if h <= current_upper + 1e-9]
+            valid = [h for h in self.high_load_factors if h <= current_upper + self._CURRICULUM_FLOAT_TOL]
             if not valid:
                 valid = [self.high_load_factors[0]]
             self._current_high = float(self._rng.choice(valid))
@@ -137,7 +149,6 @@ class HighLoadSamplingWrapper(gym.Wrapper):
 
         obs, info = self.env.reset(**kwargs)
         info['high_load_factor'] = self._current_high
-        self._episode_count += 1
         return obs, info
 
     def step(self, action):
@@ -147,67 +158,73 @@ class HighLoadSamplingWrapper(gym.Wrapper):
         return obs, reward, terminated, truncated, info
 
 
-class HighLoadLoggingCallback:
-    """SB3 callback that logs ``high_load_factor`` statistics per episode.
+def _make_high_load_logging_callback(log_interval: int = 10, verbose: int = 0):
+    """Factory that creates and returns a :class:`HighLoadLoggingCallback` instance.
 
-    Reads the ``'high_load_factor'`` key injected by
-    :class:`HighLoadSamplingWrapper` into the info dict and records it to the
-    SB3 logger (TensorBoard / CSV).  Every *log_interval* completed episodes it
-    also prints a compact distribution summary to stdout.
+    The callback logs ``high_load_factor`` statistics per episode to the SB3
+    logger (TensorBoard / CSV) and prints a distribution summary to stdout.
+
+    Lazily imports :class:`stable_baselines3.common.callbacks.BaseCallback` so
+    the module remains importable when SB3 is not installed.
 
     Args:
         log_interval: Print distribution stats to stdout every N episodes.
-        verbose: Verbosity level (passed to :class:`~stable_baselines3.common.callbacks.BaseCallback`).
+        verbose: Verbosity level passed to ``BaseCallback``.
+
+    Returns:
+        A ``BaseCallback`` instance that tracks high_load_factor per episode.
+
+    Raises:
+        RuntimeError: If ``stable_baselines3`` is not installed.
     """
+    try:
+        from stable_baselines3.common.callbacks import BaseCallback
+    except ImportError:
+        raise RuntimeError(
+            "stable_baselines3 is required to use HighLoadLoggingCallback. "
+            "Install it with: pip install stable-baselines3"
+        )
 
-    def __new__(cls, log_interval: int = 10, verbose: int = 0):
-        # Lazily import BaseCallback so the module stays importable even without SB3
-        try:
-            from stable_baselines3.common.callbacks import BaseCallback
-        except ImportError:
-            raise RuntimeError(
-                "stable_baselines3 is required to use HighLoadLoggingCallback. "
-                "Install it with: pip install stable-baselines3"
-            )
+    class _HighLoadLoggingCallbackImpl(BaseCallback):
+        """SB3 callback that logs high_load_factor per episode."""
 
-        class _Impl(BaseCallback):
-            def __init__(self, _log_interval: int, _verbose: int):
-                super().__init__(_verbose)
-                self.log_interval = _log_interval
-                self._episode_highs: list = []
-                self._total_episodes: int = 0
+        def __init__(self, log_interval: int, verbose: int):
+            super().__init__(verbose)
+            self.log_interval = log_interval
+            self._episode_highs: list = []
+            self._total_episodes: int = 0
 
-            def _on_step(self) -> bool:
-                dones = self.locals.get('dones', [])
-                infos = self.locals.get('infos', [])
-                for done, info in zip(dones, infos):
-                    if done:
-                        high = info.get('high_load_factor')
-                        if high is not None:
-                            high = float(high)
-                            self._episode_highs.append(high)
-                            self._total_episodes += 1
-                            self.logger.record(
-                                'train/episode_high_load_factor', high
+        def _on_step(self) -> bool:
+            dones = self.locals.get('dones', [])
+            infos = self.locals.get('infos', [])
+            for done, info in zip(dones, infos):
+                if done:
+                    high = info.get('high_load_factor')
+                    if high is not None:
+                        high = float(high)
+                        self._episode_highs.append(high)
+                        self._total_episodes += 1
+                        self.logger.record(
+                            'train/episode_high_load_factor', high
+                        )
+                        if self._total_episodes % self.log_interval == 0:
+                            window = self._episode_highs[-self.log_interval:]
+                            arr = np.array(window, dtype=np.float32)
+                            counts = {
+                                float(h): int((arr == h).sum())
+                                for h in np.unique(arr)
+                            }
+                            print(
+                                f"\n[HighLoad @ep {self._total_episodes}] "
+                                f"last {self.log_interval} eps — "
+                                f"mean={arr.mean():.3f}, "
+                                f"min={arr.min():.3f}, "
+                                f"max={arr.max():.3f}, "
+                                f"counts={dict(sorted(counts.items()))}"
                             )
-                            if self._total_episodes % self.log_interval == 0:
-                                window = self._episode_highs[-self.log_interval:]
-                                arr = np.array(window, dtype=np.float32)
-                                counts = {
-                                    float(h): int((arr == h).sum())
-                                    for h in np.unique(arr)
-                                }
-                                print(
-                                    f"\n[HighLoad @ep {self._total_episodes}] "
-                                    f"last {self.log_interval} eps — "
-                                    f"mean={arr.mean():.3f}, "
-                                    f"min={arr.min():.3f}, "
-                                    f"max={arr.max():.3f}, "
-                                    f"counts={dict(sorted(counts.items()))}"
-                                )
-                return True
+            return True
 
-        return _Impl(log_interval, verbose)
+    return _HighLoadLoggingCallbackImpl(log_interval, verbose)
 
 
 def make_env(
@@ -368,7 +385,7 @@ def train(args):
     try:
         from stable_baselines3 import PPO
         from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize, VecMonitor
-        from stable_baselines3.common.callbacks import CheckpointCallback
+        from stable_baselines3.common.callbacks import CallbackList, CheckpointCallback
     except ImportError as e:
         raise RuntimeError(
             "Please install stable-baselines3: pip install stable-baselines3"
@@ -514,14 +531,13 @@ def train(args):
     callbacks = [checkpoint_callback]
     if args.high_load_sampling != 'fixed':
         callbacks.append(
-            HighLoadLoggingCallback(
+            _make_high_load_logging_callback(
                 log_interval=args.high_load_log_interval,
                 verbose=0,
             )
         )
 
     # Train
-    from stable_baselines3.common.callbacks import CallbackList
     model.learn(
         total_timesteps=args.total_steps,
         callback=CallbackList(callbacks),
