@@ -4310,6 +4310,20 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         return encoding
 
     def _encode_drone(self, drone):
+        """
+        Encode a drone into an 8-dimensional feature vector.
+
+        Features:
+          0: status (normalized by max status value 7)
+          1: location x (normalized by grid_size)
+          2: location y (normalized by grid_size)
+          3: target location x (normalized by grid_size; 0 if no target)
+          4: target location y (normalized by grid_size; 0 if no target)
+          5: cargo ratio = len(cargo) / max_capacity, clipped to [0, 1]
+             (0.0 = empty cargo / pickup phase; >0 = has cargo / delivery phase)
+          6: current load ratio = current_load / max_capacity
+          7: battery level ratio = battery_level / max_battery
+        """
         encoding = np.zeros(8, dtype=np.float32)
 
         encoding[0] = drone['status'].value / 7.0
@@ -4320,7 +4334,11 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
             encoding[3] = drone['target_location'][0] / self.grid_size
             encoding[4] = drone['target_location'][1] / self.grid_size
 
-        encoding[6] = drone['current_load'] / max(1, drone['max_capacity'])
+        cargo = drone.get('cargo', set())
+        max_capacity = drone['max_capacity']
+        encoding[5] = min(len(cargo) / max(1, max_capacity), 1.0)
+
+        encoding[6] = drone['current_load'] / max(1, max_capacity)
         encoding[7] = drone['battery_level'] / max(1.0, drone['max_battery'])
         return encoding
 
