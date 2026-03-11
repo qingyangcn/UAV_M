@@ -70,8 +70,8 @@ class SingleUAVTrainingWrapper(gym.Wrapper):
         self.action_space = spaces.Discrete(self.rule_count)
 
         # Define local observation space
-        # Based on UAV_ENVIRONMENT_10 observation structure:
-        # - drone_state: 8 features
+        # Based on UAV_ENVIRONMENT_11 observation structure:
+        # - drone_state: 8 features (index 5 = cargo ratio, 0=empty/pickup, >0=has cargo/delivery)
         # - candidates: K x 12 features (K from env.num_candidates)
         # - global_context: 10 features (time=5, day_progress=1, resource_sat=1, weather=3)
         num_candidates = getattr(env.unwrapped, 'num_candidates', 20)
