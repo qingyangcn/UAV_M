@@ -336,7 +336,7 @@ class DecentralizedEventDrivenExecutor:
         Extract local observation for a specific drone.
 
         This creates a homogeneous observation that includes:
-        - Drone's own state (8 features)
+        - Drone's own state (8 features; index 5 = cargo ratio for phase detection)
         - Drone's candidate orders (K x 12 features)
         - Global context (time, weather, resource saturation)
 
