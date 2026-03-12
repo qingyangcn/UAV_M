@@ -22,6 +22,10 @@ from gymnasium import spaces
 from typing import Dict, List, Optional, Any, Tuple
 from collections import deque
 
+# Dimension of the rule-discriminant compact state produced by
+# ThreeObjectiveDroneDeliveryEnv._get_rule_based_state_for_drone()
+RULE_BASED_STATE_DIM = 20
+
 
 class EventDrivenSingleUAVWrapper(gym.Wrapper):
     """
@@ -77,9 +81,10 @@ class EventDrivenSingleUAVWrapper(gym.Wrapper):
 
         # Override observation space
         if self.local_observation:
-            # TODO: Define local observation space
-            # For now, keep original observation space
-            pass
+            # Rule-discriminant compact state (20-dim flat vector)
+            self.observation_space = spaces.Box(
+                low=0.0, high=1.0, shape=(RULE_BASED_STATE_DIM,), dtype=np.float32
+            )
         else:
             # Add current_drone_id to observation space
             # Get original observation space
@@ -254,26 +259,28 @@ class EventDrivenSingleUAVWrapper(gym.Wrapper):
         obs_out, info_out = self._get_current_observation()
         return obs_out, total_reward, terminated, truncated, info_out
 
-    def _get_current_observation(self) -> Tuple[Dict, Dict]:
+    def _get_current_observation(self) -> Tuple[Any, Dict]:
         """
         Get observation for current drone.
 
         Returns:
-            observation: Observation dict
+            observation: np.ndarray (flat 20-dim) when local_observation=True,
+                         or dict with current_drone_id when local_observation=False
             info: Info dict with metadata
         """
         if self.last_obs is None:
             # No observation yet, return empty
+            if self.local_observation:
+                return np.zeros(RULE_BASED_STATE_DIM, dtype=np.float32), {}
             return {}, {}
 
-        obs = self.last_obs.copy()
         info = self.last_info.copy() if self.last_info else {}
 
         if self.local_observation:
-            # TODO: Extract local observation for current drone
-            # For now, add current_drone_id to observation
-            obs = self._extract_local_observation(obs, self.current_drone_id)
+            # Extract compact rule-based state for current drone (flat 20-dim vector)
+            obs = self._extract_local_observation(self.last_obs, self.current_drone_id)
         else:
+            obs = self.last_obs.copy()
             # Add current_drone_id to observation for context
             obs['current_drone_id'] = np.array([self.current_drone_id if self.current_drone_id is not None else -1],
                                                dtype=np.int32)
@@ -286,51 +293,26 @@ class EventDrivenSingleUAVWrapper(gym.Wrapper):
 
         return obs, info
 
-    def _extract_local_observation(self, obs: Dict, drone_id: Optional[int]) -> Dict:
+    def _extract_local_observation(self, obs: Dict, drone_id: Optional[int]) -> np.ndarray:
         """
-        Extract local observation for a specific drone.
+        Extract the rule-discriminant compact state for a specific drone.
 
-        This creates a homogeneous observation that includes:
-        - Drone's own state
-        - Global statistics summary
-        - Candidate orders features
+        Delegates to env.unwrapped._get_rule_based_state_for_drone(drone_id) to
+        produce the 20-dimensional flat vector defined in UAV_ENVIRONMENT_11.
 
         Args:
-            obs: Full observation from environment
-            drone_id: Drone ID to extract observation for
+            obs: Full observation from environment (kept for signature compatibility,
+                 not used – the environment method reads state directly).
+            drone_id: Drone ID to extract observation for.
 
         Returns:
-            Local observation dict
+            np.ndarray of shape (RULE_BASED_STATE_DIM,), dtype=np.float32,
+            values in [0, 1]. Zero vector when drone_id is None or invalid.
         """
         if drone_id is None or drone_id < 0:
-            # No valid drone, return minimal observation
-            return {
-                'drone_state': np.zeros(8, dtype=np.float32),
-                'candidates': np.zeros((self.env.unwrapped.num_candidates, 12), dtype=np.float32),
-                'global_context': np.zeros(10, dtype=np.float32),
-            }
+            return np.zeros(RULE_BASED_STATE_DIM, dtype=np.float32)
 
-        # Extract drone's own state
-        drone_state = obs['drones'][drone_id]
-
-        # Extract drone's candidates
-        candidates = obs['candidates'][drone_id]
-
-        # Build global context (summary statistics)
-        global_context = np.concatenate([
-            obs['time'],  # 5 dims
-            obs['day_progress'],  # 1 dim
-            obs['resource_saturation'],  # 1 dim
-            obs['weather_details'][:3],  # 3 dims (first 3 weather features)
-        ])
-
-        local_obs = {
-            'drone_state': drone_state,
-            'candidates': candidates,
-            'global_context': global_context,
-        }
-
-        return local_obs
+        return self.env.unwrapped._get_rule_based_state_for_drone(drone_id)
 
     def get_statistics(self) -> Dict[str, Any]:
         """
