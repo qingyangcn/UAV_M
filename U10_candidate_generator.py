@@ -19,7 +19,7 @@ import numpy as np
 import math
 
 if TYPE_CHECKING:
-    from UAV_ENVIRONMENT_10 import ThreeObjectiveDroneDeliveryEnv
+    from UAV_ENVIRONMENT_11 import ThreeObjectiveDroneDeliveryEnv
 
 
 class CandidateGenerator(ABC):
