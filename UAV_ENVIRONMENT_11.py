@@ -4975,10 +4975,27 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
             self.last_decision_info['failure_reason'] = 'no_order_selected'
             return False
 
-        # Record selected order_id
-        self.last_decision_info['order_id'] = order_id
+        return self._commit_selected_order_to_drone(drone_id, order_id)
 
+    def _commit_selected_order_to_drone(self, drone_id: int, order_id: int) -> bool:
+        """
+        Commit a pre-selected order to a drone (shared commit logic).
+
+        Assumes drone_id is valid, drone is at a decision point, and order_id
+        exists in self.orders.  Updates self.last_decision_info in-place.
+
+        Args:
+            drone_id: The drone to commit the order to
+            order_id: The order to commit
+
+        Returns:
+            True if state changed, False otherwise
+        """
+        drone = self.drones[drone_id]
         order = self.orders[order_id]
+
+        # Store the selected order_id in decision info
+        self.last_decision_info['order_id'] = order_id
 
         # Track state before changes
         state_changed = False
@@ -5054,10 +5071,83 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
 
         # Update decision info
         self.last_decision_info['success'] = state_changed
-        if state_changed and self.last_decision_info['failure_reason'] is None:
-            self.last_decision_info['failure_reason'] = None  # Success, no failure
 
         return state_changed
+
+    def apply_candidate_index_to_drone(self, drone_id: int, candidate_idx) -> bool:
+        """
+        Apply a specific candidate (by index) to a drone for order assignment.
+
+        Instead of using a rule to select an order, this method directly selects
+        the order at position ``candidate_idx`` in the drone's candidate list.
+        This enables a "random candidate selection" or learned-index policy without
+        requiring rule-based order selection.
+
+        Args:
+            drone_id: The drone to apply the candidate to
+            candidate_idx: Index into the drone's candidate list.
+                           Pass ``-1`` or ``None`` to perform a noop.
+
+        Returns:
+            True if the candidate was successfully applied and changed state,
+            False otherwise
+
+        Side effects:
+            Updates self.last_decision_info with decision details and failure reason
+        """
+        self.last_decision_info = {
+            'drone_id': drone_id,
+            'candidate_idx': candidate_idx,
+            'success': False,
+            'failure_reason': None,
+            'order_id': None,
+        }
+
+        if candidate_idx is None or candidate_idx < 0:
+            self.last_decision_info['failure_reason'] = 'no_order_selected'
+            return False
+
+        if drone_id < 0 or drone_id >= self.num_drones:
+            self.last_decision_info['failure_reason'] = 'invalid_drone_id'
+            return False
+
+        # Check if drone is at decision point
+        if not self._is_at_decision_point(drone_id):
+            self.last_decision_info['failure_reason'] = 'not_at_decision_point'
+            return False
+
+        # Resolve candidate index → order_id via the stored candidate mapping
+        candidate_list = self.drone_candidate_mappings.get(drone_id, [])
+        if candidate_idx >= len(candidate_list):
+            self.last_decision_info['failure_reason'] = 'invalid_candidate_index'
+            return False
+
+        order_id, is_valid = candidate_list[candidate_idx]
+        if not is_valid or order_id not in self.orders:
+            self.last_decision_info['failure_reason'] = 'no_order_selected'
+            return False
+
+        return self._commit_selected_order_to_drone(drone_id, order_id)
+
+    def apply_candidate_index_to_drone_with_info(
+            self, drone_id: int, candidate_idx) -> Tuple[bool, Dict]:
+        """
+        Apply a candidate (by index) to a drone, returning success flag and info.
+
+        Convenience wrapper around :meth:`apply_candidate_index_to_drone` that
+        also returns the decision info dict.
+
+        Returns:
+            Tuple of (success: bool, info: dict) where info contains:
+                - drone_id: int
+                - candidate_idx: int or None
+                - success: bool
+                - failure_reason: str or None
+                - order_id: int or None
+        """
+        success = self.apply_candidate_index_to_drone(drone_id, candidate_idx)
+        info = dict(self.last_decision_info)
+        return success, info
 
     def apply_rule_to_drone_with_info(self, drone_id: int, rule_id: int) -> Tuple[bool, Dict]:
         """

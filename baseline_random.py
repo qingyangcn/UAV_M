@@ -1,10 +1,10 @@
 """
-Baseline: Random Rule Selection
+Baseline: Random Candidate Selection
 
-Implements a random policy baseline that selects rule_id uniformly at random
-from {0, 1, 2, 3, 4} at each decision point.
+Implements a random policy baseline that selects a candidate order uniformly
+at random from the drone's current candidate set at each decision point.
 
-Compatible with DecentralizedEventDrivenExecutor.
+Compatible with DecentralizedEventDrivenExecutor (action_mode="candidate_index").
 
 Usage:
     # Run single episode
@@ -38,8 +38,19 @@ except ImportError:
 
 
 def policy_fn(local_obs: dict) -> int:
-    """Random rule policy: selects rule_id uniformly from {0, 1, 2, 3, 4}."""
-    return int(np.random.randint(0, 5))
+    """Random candidate policy: selects a valid candidate uniformly at random.
+
+    Returns the index of a randomly chosen valid candidate from
+    ``local_obs['candidates']``, or ``-1`` if no valid candidates exist.
+    The validity of a candidate is indicated by feature index 0 (> 0.5 = valid).
+    """
+    candidates = local_obs.get('candidates')
+    if candidates is None or candidates.size == 0:
+        return -1
+    valid_indices = np.where(candidates[:, 0] > 0.5)[0]
+    if len(valid_indices) == 0:
+        return -1
+    return int(np.random.choice(valid_indices))
 
 
 def run_episode(args, seed: int) -> dict:
@@ -64,13 +75,14 @@ def run_episode(args, seed: int) -> dict:
         policy_fn=policy_fn,
         max_skip_steps=args.max_skip_steps,
         verbose=False,
+        action_mode="candidate_index",
     )
 
     executor.run_episode(max_steps=args.max_steps)
 
     stats = _compute_completion_stats(env, sc_cutoff_steps=args.candidate_k)
     stats['seed'] = seed
-    stats['policy'] = 'random'
+    stats['policy'] = 'random_candidate'
     return stats
 
 
@@ -89,7 +101,7 @@ def print_stats(stats: dict):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Baseline: Random Rule Selection"
+        description="Baseline: Random Candidate Selection"
     )
 
     parser.add_argument("--seed", type=int, default=21,
@@ -124,7 +136,7 @@ def main():
              if args.seeds is not None else [args.seed])
 
     print("=" * 80)
-    print("Baseline: Random Rule Selection")
+    print("Baseline: Random Candidate Selection")
     print(f"  Seeds: {seeds}  candidate_k={args.candidate_k}  "
           f"use_mopso={args.use_mopso and _HAS_MOPSO}")
     print("=" * 80)
