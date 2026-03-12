@@ -23,9 +23,44 @@ Usage:
         done = terminated or truncated
 """
 
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Any, Tuple, Callable
 import numpy as np
 import gymnasium as gym
+
+
+@dataclass
+class ActionStats:
+    """Per-episode action selection statistics for rule distribution analysis."""
+
+    n_rules: int = 5
+    rule_counts: Dict[int, int] = field(default_factory=dict)
+    n_decisions: int = 0
+    n_invalid_rule: int = 0
+    n_empty_candidates: int = 0
+
+    def __post_init__(self):
+        if not self.rule_counts:
+            self.rule_counts = {i: 0 for i in range(self.n_rules)}
+
+    def reset(self) -> None:
+        """Reset all counters."""
+        self.rule_counts = {i: 0 for i in range(self.n_rules)}
+        self.n_decisions = 0
+        self.n_invalid_rule = 0
+        self.n_empty_candidates = 0
+
+    def to_percent(self) -> Dict[int, float]:
+        """Return rule selection as percentage of total valid (non-invalid) decisions.
+
+        Invalid decisions (non-int or out-of-range rule_ids) are excluded from the
+        denominator.  Decisions with empty candidates are still counted because the
+        policy returned a valid rule_id for those decisions.
+        """
+        total = self.n_decisions - self.n_invalid_rule
+        if total <= 0:
+            return {i: 0.0 for i in range(self.n_rules)}
+        return {i: self.rule_counts[i] / total * 100.0 for i in range(self.n_rules)}
 
 
 class DecentralizedEventDrivenExecutor:
@@ -43,6 +78,8 @@ class DecentralizedEventDrivenExecutor:
         policy_fn: Function that takes local_obs and returns rule_id (0-4)
         max_skip_steps: Maximum steps to skip when waiting for decisions
         verbose: Whether to print execution details
+        track_action_stats: Whether to track per-rule action selection statistics
+        n_rules: Number of rules (used when track_action_stats is True)
     """
 
     def __init__(
@@ -50,15 +87,22 @@ class DecentralizedEventDrivenExecutor:
             env: gym.Env,
             policy_fn: Callable[[Dict], int],
             max_skip_steps: int = 10,
-            verbose: bool = False
+            verbose: bool = False,
+            track_action_stats: bool = False,
+            n_rules: int = 5,
     ):
         self.env = env
         self.policy_fn = policy_fn
         self.max_skip_steps = max_skip_steps
         self.verbose = verbose
+        self.track_action_stats = track_action_stats
+        self.n_rules = n_rules
 
         # Unwrap environment to access methods
         self.unwrapped_env = env.unwrapped
+
+        # Action selection statistics (populated only when track_action_stats=True)
+        self._action_stats = ActionStats(n_rules=n_rules)
 
         # Statistics
         self.total_decisions = 0
@@ -105,6 +149,10 @@ class DecentralizedEventDrivenExecutor:
         self.commit_fail_by_reason = {}
         self.cumulative_reward = 0.0
         self.episode_active = True
+
+        # Reset action stats if tracking is enabled
+        if self.track_action_stats:
+            self._action_stats.reset()
 
         # Add executor info
         info['executor'] = self.get_statistics()
@@ -206,6 +254,10 @@ class DecentralizedEventDrivenExecutor:
 
             # Call policy to get rule_id
             rule_id = self.policy_fn(local_obs)
+
+            # Record action stats if tracking is enabled
+            if self.track_action_stats:
+                self._record_rule_action(local_obs, rule_id)
 
             # Submit to centralized arbitrator (use with_info if available)
             if hasattr(self.unwrapped_env, 'apply_rule_to_drone_with_info'):
@@ -347,6 +399,44 @@ class DecentralizedEventDrivenExecutor:
             np.ndarray of shape (RULE_BASED_STATE_DIM,), dtype=np.float32
         """
         return self.unwrapped_env._get_rule_based_state_for_drone(drone_id)
+
+    def _record_rule_action(self, local_obs: Dict, rule_id) -> None:
+        """Record a single policy decision into the action stats.
+
+        Args:
+            local_obs: Local observation passed to the policy.
+            rule_id: Rule identifier returned by the policy.
+        """
+        self._action_stats.n_decisions += 1
+
+        # Validate rule_id
+        if isinstance(rule_id, int) and 0 <= rule_id < self.n_rules:
+            self._action_stats.rule_counts[rule_id] += 1
+        else:
+            self._action_stats.n_invalid_rule += 1
+
+        # Check for empty candidates (all-zero array indicates no real candidates)
+        candidates = local_obs.get('candidates')
+        if candidates is not None:
+            try:
+                if hasattr(candidates, 'shape') and candidates.ndim == 2:
+                    if np.all(candidates == 0):
+                        self._action_stats.n_empty_candidates += 1
+            except (AttributeError, TypeError, ValueError):
+                pass
+
+    def get_action_stats(self) -> ActionStats:
+        """Return the current action selection statistics.
+
+        Returns:
+            ActionStats object with rule_counts, n_decisions, n_invalid_rule,
+            n_empty_candidates, and a to_percent() method.
+        """
+        return self._action_stats
+
+    def reset_action_stats(self) -> None:
+        """Reset action selection statistics."""
+        self._action_stats.reset()
 
     def get_statistics(self) -> Dict[str, Any]:
         """
