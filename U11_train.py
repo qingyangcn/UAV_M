@@ -1,5 +1,5 @@
 """
-U10 PPO Training with MOPSO Candidate Generation + Event-Driven Execution
+U11 PPO Training with MOPSO Candidate Generation + Event-Driven Execution
 
 This script implements a hierarchical decision-making system for UAV delivery with
 two training modes:
@@ -8,21 +8,23 @@ two training modes:
    - Centralized Training, Decentralized Execution
    - Trains a single shared policy that each drone can use independently
    - Action space: Discrete(5) - single rule_id
-   - Observation: Local observation (drone_state, candidates, global_context)
+   - Observation: Rule-discriminant compact state (20-dim Box)
+     Features: drone own-state, candidate task structure, rule-discriminant
+     metrics (slack, distance, slack/distance) and global context.
    - Enables true decentralized execution during deployment
    - Each drone makes independent decisions using shared policy weights
 
-2. CENTRAL_QUEUE (Legacy):
-   - Centralized queue-based decision making
+2. CENTRAL_QUEUE (Compatibility):
+   - Centralized queue-based decision making (FIFO drone order)
    - Action space: Discrete(5) - single rule_id for current drone
-   - Observation: Full observation with current_drone_id
+   - Observation: Same compact 20-dim Box as above
    - Processes drones one by one through central queue
 
 UPPER LAYER (Candidate Generation):
 - Uses MOPSOCandidateGenerator to generate candidate order sets for each drone
 - MOPSO only generates candidates - it does NOT commit orders (READY -> ASSIGNED)
 - Candidates are refreshed periodically (controlled by candidate_update_interval)
-- Candidate generation uses multi-objective optimization to suggest promising orders
+- Candidate generation uses multi-objective optimisation to suggest promising orders
 
 LOWER LAYER (Rule Selection):
 - Uses wrapper for event-driven decision making
@@ -32,24 +34,24 @@ LOWER LAYER (Rule Selection):
 - Wrapper automatically advances time when no decisions are needed
 
 Environment: UAV_ENVIRONMENT_11.ThreeObjectiveDroneDeliveryEnv
-- Observation: Dict with candidates, drones, time, etc.
+- Observation exposed to PPO: flat Box(20) rule-discriminant compact state
 - Reward: scalar (required for SB3 PPO)
 - Candidates constrained by upper layer MOPSO suggestions
 
 Training:
-- Algorithm: PPO with MultiInputPolicy
+- Algorithm: PPO with MlpPolicy (flat Box observation)
 - Normalization: VecNormalize for stability
 - Checkpointing: Model and VecNormalize stats saved periodically
 
 Usage:
     # Train with event-driven shared policy (CTDE - default)
-    python U10_train.py --total-steps 200000 --seed 42 --num-drones 20 --candidate-k 20
+    python U11_train.py --total-steps 200000 --seed 42 --num-drones 20 --candidate-k 20
 
     # Train with legacy central queue mode
-    python U10_train.py --training-mode central_queue --total-steps 200000
+    python U11_train.py --training-mode central_queue --total-steps 200000
 
     # Quick test run
-    python U10_train.py --total-steps 1000
+    python U11_train.py --total-steps 1000
 """
 
 from __future__ import annotations
@@ -241,15 +243,9 @@ def train(args):
     env = DummyVecEnv([env_fn])
     env = VecMonitor(env)
 
-    # VecNormalize for training stability
-    # Extract Box observation keys for normalization
-    # Note: [0] indexing assumes DummyVecEnv where all envs share the same observation space
-    # This is safe because we use DummyVecEnv([env_fn]) above
-    box_obs_keys = [
-        key for key, space in env.get_attr('observation_space')[0].spaces.items()
-        if isinstance(space, gym.spaces.Box)
-    ]
-
+    # VecNormalize for training stability.
+    # The observation is now a flat Box (compact rule-based state), so we do NOT
+    # need to specify norm_obs_keys – VecNormalize normalises the entire vector.
     env = VecNormalize(
         env,
         norm_obs=True,
@@ -257,18 +253,17 @@ def train(args):
         clip_obs=10.0,
         clip_reward=10.0,
         gamma=args.gamma,
-        norm_obs_keys=box_obs_keys,
     )
 
     # Print configuration
     print("=" * 80)
-    print("U10 PPO Training: MOPSO Candidate Generation + Event-Driven Single UAV")
+    print("U11 PPO Training: MOPSO Candidate Generation + Event-Driven Single UAV")
     print("=" * 80)
     print(f"Training Mode: {args.training_mode}")
     if args.training_mode == 'event_driven_shared_policy':
         print(f"  → Shared Policy for Decentralized Execution (CTDE)")
         print(f"  → Drone Sampling: {args.drone_sampling}")
-    print(f"Environment: UAV_ENVIRONMENT_10.ThreeObjectiveDroneDeliveryEnv")
+    print(f"Environment: UAV_ENVIRONMENT_11.ThreeObjectiveDroneDeliveryEnv")
     print(f"  num_drones={args.num_drones}, obs_max_orders={args.obs_max_orders}")
     print(f"  top_k_merchants={args.top_k_merchants}, candidate_k={args.candidate_k}")
     print(f"  rule_count={args.rule_count} (Discrete action space)")
@@ -284,9 +279,10 @@ def train(args):
     else:
         print(f"  Wrapper: EventDrivenSingleUAVWrapper")
     print(f"  Action space: Discrete({args.rule_count})")
+    print(f"  Observation: compact rule-based state (Box {env.get_attr('observation_space')[0].shape})")
     print(f"  max_skip_steps={args.max_skip_steps}")
     print(f"\nTraining:")
-    print(f"  Algorithm: PPO with MultiInputPolicy")
+    print(f"  Algorithm: PPO with MlpPolicy")
     print(f"  VecNormalize: ENABLED (norm_obs=True, norm_reward=True)")
     print(f"  Total steps: {args.total_steps}")
     print(f"  Seed: {args.seed}")
@@ -294,14 +290,14 @@ def train(args):
     print(f"  enable_diagnostics={args.enable_diagnostics}, interval={args.diagnostics_interval}")
     print("=" * 80)
 
-    # Print action space to verify it's Discrete(5)
+    # Print action/observation space info
     print(f"\nAction space: {env.get_attr('action_space')[0]}")
-    print(f"Observation space keys: {list(env.get_attr('observation_space')[0].spaces.keys())}")
+    print(f"Observation space: {env.get_attr('observation_space')[0]}")
     print()
 
-    # Create PPO model
+    # Create PPO model with MlpPolicy (flat Box observation)
     model = PPO(
-        policy="MultiInputPolicy",
+        policy="MlpPolicy",
         env=env,
         learning_rate=args.lr,
         n_steps=args.n_steps,
@@ -319,7 +315,7 @@ def train(args):
     checkpoint_callback = CheckpointCallback(
         save_freq=args.save_freq,
         save_path=args.model_dir,
-        name_prefix="ppo_u10",
+        name_prefix="ppo_u11",
         save_replay_buffer=False,
         save_vecnormalize=True,
     )
@@ -332,12 +328,12 @@ def train(args):
     )
 
     # Save final model
-    final_path = os.path.join(args.model_dir, "ppo_u10_final")
+    final_path = os.path.join(args.model_dir, "ppo_u11_final")
     model.save(final_path)
     print(f"\nSaved final model to: {final_path}")
 
     # Save VecNormalize statistics
-    vecnormalize_path = os.path.join(args.model_dir, "vecnormalize_u10_final.pkl")
+    vecnormalize_path = os.path.join(args.model_dir, "vecnormalize_u11_final.pkl")
     env.save(vecnormalize_path)
     print(f"Saved VecNormalize statistics to: {vecnormalize_path}")
     print(f"Note: Load VecNormalize when evaluating: VecNormalize.load('{vecnormalize_path}', venv)")
