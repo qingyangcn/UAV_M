@@ -4295,6 +4295,183 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
 
         return obs_dict
 
+    # ---- constant: dimension of rule-based compact state ----
+    RULE_BASED_STATE_DIM = 20
+
+    def _get_rule_based_state_for_drone(self, drone_id: int) -> np.ndarray:
+        """
+        Build the rule-discriminant compact state for a single drone (20-dimensional).
+
+        This compact state is designed for the lower-layer PPO to discriminate between
+        the 5 rule actions:
+          Rule 0: CARGO_FIRST       – prioritise delivering cargo already on board
+          Rule 1: ASSIGNED_EDF      – earliest-deadline assigned order
+          Rule 2: READY_EDF         – earliest-deadline ready (unassigned) order
+          Rule 3: NEAREST_PICKUP    – closest pickup merchant
+          Rule 4: SLACK_PER_DISTANCE– highest slack / distance ratio
+
+        It replaces the former high-dimensional global dict observation (orders,
+        merchants, bases, pareto_info, objective_weights, etc.) with a
+        low-dimensional, interpretable, rule-relevant feature vector.
+
+        State layout (20 features, all normalised to [0, 1]):
+          A. Drone own state (indices 0-4)
+             0  u_status          – drone status / 7
+             1  u_battery_ratio   – battery_level / max_battery
+             2  u_load_ratio      – current_load / max_capacity
+             3  u_cargo_ratio     – |cargo| / max_capacity
+             4  u_dist_to_target  – distance to current target / max_grid_dist
+          B. Candidate task structure (indices 5-9)
+             5  cand_cargo_count_ratio    – PICKED_UP fraction among valid candidates
+             6  cand_assigned_count_ratio – ASSIGNED fraction
+             7  cand_ready_count_ratio    – READY fraction
+             8  cand_urgent_ratio         – urgent fraction
+             9  cand_min_slack            – tightest deadline slack (normalised)
+          C. Rule-discriminant features (indices 10-15)
+             10 cargo_best_slack         – best slack among on-board cargo
+             11 assigned_best_slack      – best slack among assigned orders
+             12 ready_best_slack         – best slack among ready orders
+             13 nearest_pickup_dist      – nearest merchant distance (normalised)
+             14 best_slack_per_distance  – best slack/dist ratio (normalised)
+             15 ready_urgent_ratio       – urgent fraction among READY candidates
+          D. Global correction (indices 16-19)
+             16 sys_resource_saturation  – busy-drone ratio
+             17 sys_backlog_ratio        – active orders / max_obs_orders
+             18 env_weather_severity     – weather enum value / 3
+             19 env_is_peak_hour         – 1.0 if peak hour else 0.0
+
+        Returns:
+            np.ndarray of shape (20,), dtype=np.float32, values in [0, 1]
+        """
+        state = np.zeros(self.RULE_BASED_STATE_DIM, dtype=np.float32)
+
+        if drone_id not in self.drones:
+            return state
+
+        drone = self.drones[drone_id]
+        current_step = self.time_system.current_step
+        # Largest possible distance on the grid (corner to corner)
+        max_dist = math.sqrt(2) * self.grid_size + 1e-6
+        # Normalisation constant for deadline slack (steps)
+        slack_norm = 50.0
+
+        # ---- A. Drone own state ----
+        state[0] = drone['status'].value / 7.0
+        state[1] = drone['battery_level'] / max(1.0, drone['max_battery'])
+        state[2] = drone['current_load'] / max(1, drone['max_capacity'])
+        cargo = drone.get('cargo', set())
+        state[3] = len(cargo) / max(1, drone['max_capacity'])
+        dist_to_target = self._get_dist_to_target(drone_id)
+        state[4] = min(dist_to_target / max_dist, 1.0)
+
+        # ---- B. Candidate task structure state ----
+        candidate_list = self.drone_candidate_mappings.get(drone_id, [])
+        valid_orders = []
+        for oid, is_valid in candidate_list:
+            if is_valid and oid >= 0 and oid in self.orders:
+                valid_orders.append(self.orders[oid])
+        num_valid = max(len(valid_orders), 1)
+
+        cargo_count = sum(1 for o in valid_orders if o['status'] == OrderStatus.PICKED_UP)
+        assigned_count = sum(1 for o in valid_orders if o['status'] == OrderStatus.ASSIGNED)
+        ready_count = sum(1 for o in valid_orders if o['status'] == OrderStatus.READY)
+        urgent_count = sum(1 for o in valid_orders if o.get('urgent', False))
+
+        state[5] = cargo_count / num_valid
+        state[6] = assigned_count / num_valid
+        state[7] = ready_count / num_valid
+        state[8] = urgent_count / num_valid
+
+        if valid_orders:
+            slacks = [self._get_delivery_deadline_step(o) - current_step for o in valid_orders]
+            min_slack = min(slacks)
+            state[9] = float(np.clip(min_slack / slack_norm + 0.5, 0.0, 1.0))
+        else:
+            state[9] = 1.0  # No urgency when no candidates
+
+        # ---- C. Rule-discriminant features ----
+        drone_loc = drone['location']
+
+        # Cargo orders currently on board (PICKED_UP)
+        cargo_orders = [self.orders[oid] for oid in cargo
+                        if oid in self.orders and
+                        self.orders[oid]['status'] == OrderStatus.PICKED_UP]
+        if cargo_orders:
+            best_cargo_slack = max(
+                self._get_delivery_deadline_step(o) - current_step for o in cargo_orders
+            )
+            state[10] = float(np.clip(best_cargo_slack / slack_norm + 0.5, 0.0, 1.0))
+        else:
+            state[10] = 1.0  # Neutral when no cargo
+
+        # Assigned orders for this drone among valid candidates
+        assigned_orders = [o for o in valid_orders
+                           if o['status'] == OrderStatus.ASSIGNED and
+                           o.get('assigned_drone') == drone_id]
+        if assigned_orders:
+            best_assigned_slack = max(
+                self._get_delivery_deadline_step(o) - current_step for o in assigned_orders
+            )
+            state[11] = float(np.clip(best_assigned_slack / slack_norm + 0.5, 0.0, 1.0))
+        else:
+            state[11] = 1.0
+
+        # Ready unassigned orders among valid candidates
+        ready_orders = [o for o in valid_orders
+                        if o['status'] == OrderStatus.READY and
+                        o.get('assigned_drone', -1) in (-1, None)]
+        if ready_orders:
+            best_ready_slack = max(
+                self._get_delivery_deadline_step(o) - current_step for o in ready_orders
+            )
+            state[12] = float(np.clip(best_ready_slack / slack_norm + 0.5, 0.0, 1.0))
+        else:
+            state[12] = 1.0
+
+        # Nearest pickup distance (min merchant distance for ASSIGNED/READY candidates)
+        pickup_dists = []
+        for o in valid_orders:
+            if o['status'] in (OrderStatus.ASSIGNED, OrderStatus.READY):
+                ml = o.get('merchant_location')
+                if ml:
+                    pickup_dists.append(
+                        self._calculate_euclidean_distance(drone_loc, ml)
+                    )
+        state[13] = (min(pickup_dists) / max_dist) if pickup_dists else 1.0
+
+        # Best slack-per-distance ratio across all valid candidates
+        best_spd = 0.0
+        for o in valid_orders:
+            ml = None
+            if o['status'] in (OrderStatus.ASSIGNED, OrderStatus.READY):
+                ml = o.get('merchant_location')
+            elif o['status'] == OrderStatus.PICKED_UP:
+                ml = o.get('customer_location')
+            if ml:
+                dist = self._calculate_euclidean_distance(drone_loc, ml)
+                slack = self._get_delivery_deadline_step(o) - current_step
+                spd = slack / (dist + 0.1)
+                if spd > best_spd:
+                    best_spd = spd
+        # Normalise: slack/dist values typically in [0, ~500]; clip to [0, 1]
+        state[14] = float(np.clip(best_spd / 500.0, 0.0, 1.0))
+
+        # Urgent fraction within READY candidates
+        if ready_orders:
+            urgent_ready = sum(1 for o in ready_orders if o.get('urgent', False))
+            state[15] = urgent_ready / len(ready_orders)
+        else:
+            state[15] = 0.0
+
+        # ---- D. Global correction state ----
+        state[16] = self._calculate_resource_saturation()
+        state[17] = min(len(self.active_orders) / max(self.max_obs_orders, 1), 1.0)
+        state[18] = self.weather.value / 3.0
+        time_state = self.time_system.get_time_state()
+        state[19] = 1.0 if time_state['is_peak_hour'] else 0.0
+
+        return np.clip(state, 0.0, 1.0)
+
     def _encode_order(self, order):
         encoding = np.zeros(10, dtype=np.float32)
         encoding[order['status'].value] = 1.0
