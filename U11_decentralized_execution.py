@@ -331,43 +331,22 @@ class DecentralizedEventDrivenExecutor:
             return self.unwrapped_env.last_obs
         raise RuntimeError("Cannot obtain current observation from environment.")
 
-    def _extract_local_observation(self, full_obs: Dict, drone_id: int) -> Dict:
+    def _extract_local_observation(self, full_obs: Dict, drone_id: int) -> np.ndarray:
         """
-        Extract local observation for a specific drone.
+        Return the compact rule-based state vector for a specific drone.
 
-        This creates a homogeneous observation that includes:
-        - Drone's own state (8 features; index 5 = cargo ratio for phase detection)
-        - Drone's candidate orders (K x 12 features)
-        - Global context (time, weather, resource saturation)
+        Delegates to env.unwrapped._get_rule_based_state_for_drone(), which builds
+        the 20-dimensional rule-discriminant feature vector directly from environment
+        state. The full_obs argument is accepted for API compatibility but is not used.
 
         Args:
-            full_obs: Full observation from environment
+            full_obs: Full observation from environment (unused)
             drone_id: Drone ID to extract observation for
 
         Returns:
-            Local observation dict with keys: drone_state, candidates, global_context
+            np.ndarray of shape (RULE_BASED_STATE_DIM,), dtype=np.float32
         """
-        # Extract drone's own state
-        drone_state = full_obs['drones'][drone_id]
-
-        # Extract drone's candidates
-        candidates = full_obs['candidates'][drone_id]
-
-        # Build global context (summary statistics)
-        global_context = np.concatenate([
-            full_obs['time'],  # 5 dims: hour, minute, day, day_in_week, month
-            full_obs['day_progress'],  # 1 dim
-            full_obs['resource_saturation'],  # 1 dim
-            full_obs['weather_details'][:3],  # 3 dims (first 3 weather features)
-        ])
-
-        local_obs = {
-            'drone_state': drone_state.astype(np.float32),
-            'candidates': candidates.astype(np.float32),
-            'global_context': global_context.astype(np.float32),
-        }
-
-        return local_obs
+        return self.unwrapped_env._get_rule_based_state_for_drone(drone_id)
 
     def get_statistics(self) -> Dict[str, Any]:
         """

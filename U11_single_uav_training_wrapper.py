@@ -5,13 +5,16 @@ This wrapper enables training a shared policy that can be used by all drones
 in a decentralized manner. It provides:
 
 1. Discrete(5) action space (independent of number of drones N)
-2. Local observation for the current decision drone
+2. Rule-discriminant compact observation for the current decision drone (20-dim Box)
 3. Drone sampling strategy for training data generation
 4. Compatibility with SB3 PPO and other single-agent RL algorithms
 
 Key Features:
 - Action space: Discrete(5) - one rule_id per step
-- Observation: Local observation (drone_state, candidates, global_context)
+- Observation: Rule-based compact state vector (20 features, Box)
+  Replaces the former high-dimensional Dict(drone_state, candidates, global_context).
+  Features cover drone own-state, candidate task structure, rule-discriminant
+  metrics and global context – see env._get_rule_based_state_for_drone() for details.
 - Drone selection: Randomly samples from drones at decision points
 - Episode handling: Advances until episode end or max steps reached
 
@@ -19,9 +22,9 @@ Usage:
     env = ThreeObjectiveDroneDeliveryEnv(...)
     env = SingleUAVTrainingWrapper(env)
 
-    # Now env has Discrete(5) action space and local observations
+    # Now env has Discrete(5) action space and compact (20-dim) observations
     # Compatible with SB3 PPO:
-    model = PPO("MultiInputPolicy", env, ...)
+    model = PPO("MlpPolicy", env, ...)
 """
 
 from typing import Dict, List, Optional, Any, Tuple
@@ -36,7 +39,7 @@ class SingleUAVTrainingWrapper(gym.Wrapper):
 
     This wrapper:
     1. Converts action space from MultiDiscrete([R]*N) to Discrete(R)
-    2. Provides local observation for the current decision drone
+    2. Provides rule-discriminant compact observation (20-dim Box) for the current drone
     3. Samples drones at decision points to generate training data
     4. Advances environment to next decision event when needed
 
@@ -44,7 +47,8 @@ class SingleUAVTrainingWrapper(gym.Wrapper):
         env: The base UAV environment
         max_skip_steps: Maximum steps to skip when waiting for decisions
         drone_sampling: Strategy for selecting drones ('random', 'round_robin')
-        local_obs_only: If True, only return local observation (no global info)
+        local_obs_only: Retained for API compatibility; observation is always the
+                        compact rule-based state vector regardless of this flag
     """
 
     def __init__(
@@ -69,24 +73,12 @@ class SingleUAVTrainingWrapper(gym.Wrapper):
         # Override action space to single discrete action
         self.action_space = spaces.Discrete(self.rule_count)
 
-        # Define local observation space
-        # Based on UAV_ENVIRONMENT_11 observation structure:
-        # - drone_state: 8 features (index 5 = cargo ratio, 0=empty/pickup, >0=has cargo/delivery)
-        # - candidates: K x 12 features (K from env.num_candidates)
-        # - global_context: 10 features (time=5, day_progress=1, resource_sat=1, weather=3)
-        num_candidates = getattr(env.unwrapped, 'num_candidates', 20)
-
-        self.observation_space = spaces.Dict({
-            'drone_state': spaces.Box(
-                low=0, high=1, shape=(8,), dtype=np.float32
-            ),
-            'candidates': spaces.Box(
-                low=0, high=1, shape=(num_candidates, 12), dtype=np.float32
-            ),
-            'global_context': spaces.Box(
-                low=0, high=1, shape=(10,), dtype=np.float32
-            ),
-        })
+        # Compact rule-based state: flat Box of RULE_BASED_STATE_DIM features.
+        # All values are normalised to [0, 1].
+        state_dim = getattr(env.unwrapped, 'RULE_BASED_STATE_DIM', 20)
+        self.observation_space = spaces.Box(
+            low=0.0, high=1.0, shape=(state_dim,), dtype=np.float32
+        )
 
         # Current drone being processed
         self.current_drone_id: Optional[int] = None
@@ -102,12 +94,12 @@ class SingleUAVTrainingWrapper(gym.Wrapper):
         self.total_skip_steps = 0
         self.episode_steps = 0
 
-    def reset(self, **kwargs) -> Tuple[Dict, Dict]:
+    def reset(self, **kwargs) -> Tuple[np.ndarray, Dict]:
         """
-        Reset environment and get first local observation.
+        Reset environment and get first compact local observation.
 
         Returns:
-            observation: Local observation for first decision drone
+            observation: Compact rule-based state vector for first decision drone
             info: Info dictionary
         """
         # Reset underlying environment
@@ -135,7 +127,7 @@ class SingleUAVTrainingWrapper(gym.Wrapper):
             self.last_info = info
             self._populate_decision_queue()
 
-        # Get local observation
+        # Get compact local observation
         local_obs = self._extract_local_observation(
             self.last_full_obs, self.current_drone_id
         )
@@ -150,7 +142,7 @@ class SingleUAVTrainingWrapper(gym.Wrapper):
 
         return local_obs, info
 
-    def step(self, action: int) -> Tuple[Dict, float, bool, bool, Dict]:
+    def step(self, action: int) -> Tuple[np.ndarray, float, bool, bool, Dict]:
         """
         Execute action for current drone and advance to next decision.
 
@@ -158,7 +150,7 @@ class SingleUAVTrainingWrapper(gym.Wrapper):
             action: Rule ID (0-4) to apply to current drone
 
         Returns:
-            observation: Next local observation
+            observation: Next compact local observation
             reward: Accumulated reward
             terminated: Whether episode terminated
             truncated: Whether episode truncated
@@ -201,7 +193,7 @@ class SingleUAVTrainingWrapper(gym.Wrapper):
             self.last_info = info
             self._populate_decision_queue()
 
-        # Get next local observation
+        # Get next compact local observation
         local_obs = self._extract_local_observation(
             self.last_full_obs, self.current_drone_id
         )
@@ -305,44 +297,25 @@ class SingleUAVTrainingWrapper(gym.Wrapper):
             self,
             full_obs: Optional[Dict],
             drone_id: Optional[int]
-    ) -> Dict:
+    ) -> np.ndarray:
         """
-        Extract local observation for a specific drone.
+        Return the compact rule-based state vector for a specific drone.
+
+        Delegates to env.unwrapped._get_rule_based_state_for_drone() which builds
+        the 20-dimensional rule-discriminant feature vector directly from environment
+        state (independent of the full observation dict).
 
         Args:
-            full_obs: Full observation from environment
+            full_obs: Full observation from environment (unused; kept for API compat)
             drone_id: Drone ID to extract observation for (None = return zeros)
 
         Returns:
-            Local observation dict with keys: drone_state, candidates, global_context
+            np.ndarray of shape (RULE_BASED_STATE_DIM,), dtype=np.float32
         """
-        if full_obs is None or drone_id is None:
-            # Return zero observation
-            num_candidates = self.observation_space['candidates'].shape[0]
-            return {
-                'drone_state': np.zeros(8, dtype=np.float32),
-                'candidates': np.zeros((num_candidates, 12), dtype=np.float32),
-                'global_context': np.zeros(10, dtype=np.float32),
-            }
+        state_dim = self.observation_space.shape[0]
 
-        # Extract drone's own state
-        drone_state = full_obs['drones'][drone_id].astype(np.float32)
+        if drone_id is None:
+            return np.zeros(state_dim, dtype=np.float32)
 
-        # Extract drone's candidates
-        candidates = full_obs['candidates'][drone_id].astype(np.float32)
+        return self.env.unwrapped._get_rule_based_state_for_drone(drone_id)
 
-        # Build global context (summary statistics)
-        global_context = np.concatenate([
-            full_obs['time'],  # 5 dims
-            full_obs['day_progress'],  # 1 dim
-            full_obs['resource_saturation'],  # 1 dim
-            full_obs['weather_details'][:3],  # 3 dims (first 3 weather features)
-        ]).astype(np.float32)
-
-        local_obs = {
-            'drone_state': drone_state,
-            'candidates': candidates,
-            'global_context': global_context,
-        }
-
-        return local_obs
