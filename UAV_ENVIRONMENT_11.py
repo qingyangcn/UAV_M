@@ -4356,6 +4356,7 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         slack_norm = 50.0
 
         # ---- A. Drone own state ----
+        # DroneStatus has values 0-7 (IDLE=0 … CHARGING=7); divide by 7 to normalise
         state[0] = drone['status'].value / 7.0
         state[1] = drone['battery_level'] / max(1.0, drone['max_battery'])
         state[2] = drone['current_load'] / max(1, drone['max_capacity'])
@@ -4450,10 +4451,11 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
             if ml:
                 dist = self._calculate_euclidean_distance(drone_loc, ml)
                 slack = self._get_delivery_deadline_step(o) - current_step
+                # Small epsilon avoids division by zero when drone is at the location
                 spd = slack / (dist + 0.1)
                 if spd > best_spd:
                     best_spd = spd
-        # Normalise: slack/dist values typically in [0, ~500]; clip to [0, 1]
+        # Typical slack/dist range: slack ≤ ~50 steps, dist ≥ 0.1  → max ≈ 500
         state[14] = float(np.clip(best_spd / 500.0, 0.0, 1.0))
 
         # Urgent fraction within READY candidates
