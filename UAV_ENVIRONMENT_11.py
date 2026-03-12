@@ -1115,6 +1115,20 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                  battery_return_threshold: float = 10.0,  # Low battery threshold for forced return (battery_units)
                  # ===== Order cutoff window =====
                  order_cutoff_steps: int = 0,  # Stop accepting orders this many steps before business end (0=disabled)
+                 # ===== Sigmoid hazard cancellation =====
+                 enable_sigmoid_hazard_cancellation: bool = True,
+                 # Enable stochastic sigmoid-hazard order cancellation (replaces hard deadline).
+                 # When True, each active READY/ASSIGNED order is cancelled probabilistically each step
+                 # using h(w) = hazard_p_max * sigmoid(hazard_k * (w - hazard_midpoint_steps)).
+                 hazard_p_max: float = 0.05,
+                 # Maximum per-step cancellation probability (upper bound of hazard curve).
+                 # A value of 0.05 means at most 5% chance of cancellation per step even at very long waits.
+                 hazard_k: float = 0.3,
+                 # Steepness of the sigmoid hazard curve. Higher values create a sharper transition
+                 # around the midpoint. Default 0.3 gives a gradual ramp-up.
+                 hazard_midpoint_steps: float = 12.0,
+                 # Waiting-time midpoint (in steps) where the hazard reaches 50% of p_max.
+                 # Default 12 steps (~3 hours at 4 steps/hour) is when risk begins rising noticeably.
                  ):
         super().__init__()
 
@@ -1205,6 +1219,12 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         # ========== Order cutoff window ==========
         self.order_cutoff_steps = int(order_cutoff_steps)  # Steps before business end to stop accepting orders
 
+        # ========== Sigmoid hazard cancellation ==========
+        self.enable_sigmoid_hazard_cancellation = bool(enable_sigmoid_hazard_cancellation)
+        self.hazard_p_max = float(hazard_p_max)
+        self.hazard_k = float(hazard_k)
+        self.hazard_midpoint_steps = float(hazard_midpoint_steps)
+
         # ========== shaping 参数 ==========
         self.shaping_progress_k = float(shaping_progress_k)
         self.shaping_distance_k = float(shaping_distance_k)
@@ -1277,6 +1297,7 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
             'total_flight_distance': 0.0,
             'optimal_flight_distance': 0.0,
             'forced_return_events': 0,  # Track forced returns due to low battery
+            'total_waiting_time': 0,    # Cumulative (delivery_time - creation_time) for completed orders
         }
 
         # Debug tracking for on_time_deliveries (to detect decreases)
@@ -1289,6 +1310,7 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
             'completed_orders': 0,
             'cancelled_orders': 0,
             'total_delivery_time': 0,
+            'total_waiting_time': 0,    # Cumulative (delivery_time - creation_time) for completed orders
             'total_revenue': 0,
             'total_cost': 0,
             'energy_consumed': 0,
@@ -1799,6 +1821,9 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         # 动态事件 (includes position update and merchant preparation)
         self._process_events()
 
+        # 随机 sigmoid hazard 取消
+        self._apply_sigmoid_hazard_cancellations()
+
         # 清理过期分配
         self._cleanup_stale_assignments()
 
@@ -1937,6 +1962,7 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
             'on_time_deliveries': 0,
             'total_flight_distance': 0.0,
             'optimal_flight_distance': 0.0,
+            'total_waiting_time': 0,
         })
 
     def _generate_morning_orders(self):
@@ -1986,6 +2012,12 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
 
         self.metrics['completed_orders'] += 1
         self.daily_stats['orders_completed'] += 1
+
+        # Track waiting time
+        waiting_time = order['delivery_time'] - order['creation_time']
+        self.metrics['total_waiting_time'] += waiting_time
+        self.daily_stats['total_waiting_time'] = (
+            self.daily_stats.get('total_waiting_time', 0)) + waiting_time
 
         # Check if delivery was on-time using helper method
         if self._is_order_on_time(order):
@@ -3693,8 +3725,11 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
 
         delivery_duration = order['delivery_time'] - order['creation_time']
         self.metrics['total_delivery_time'] += delivery_duration
+        self.metrics['total_waiting_time'] += delivery_duration
         self.metrics['completed_orders'] += 1
         self.daily_stats['orders_completed'] += 1
+        self.daily_stats['total_waiting_time'] = (
+            self.daily_stats.get('total_waiting_time', 0)) + delivery_duration
 
         # Calculate delivery lateness for diagnostics using helper method
         delivery_lateness = self._calculate_delivery_lateness(order)
@@ -4116,17 +4151,76 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
 
     # ------------------ stale assignment cleanup ------------------
 
+    def _get_order_cancel_probability(self, order: dict, current_step: int) -> float:
+        """Compute per-step cancellation probability using a sigmoid hazard model.
+
+        The hazard function is:
+            h(w) = p_max * sigmoid(k * (w - w0))
+
+        where:
+            w   = elapsed waiting time in steps since the order became READY
+                  (falls back to creation_time if ready_step is unavailable)
+            w0  = hazard_midpoint_steps  (midpoint where risk reaches 50% of p_max)
+            k   = hazard_k               (slope of the sigmoid)
+            p_max = hazard_p_max         (maximum per-step cancellation probability)
+
+        Args:
+            order: Order dict from self.orders.
+            current_step: Current simulation step.
+
+        Returns:
+            Float in [0, p_max]: probability of cancellation this step.
+        """
+        start_step = order.get('ready_step')
+        if start_step is None:
+            start_step = order.get('creation_time', current_step)
+        waiting_time = max(0, current_step - start_step)
+        raw_exponent = self.hazard_k * (waiting_time - self.hazard_midpoint_steps)
+        # sigmoid = 1 / (1 + exp(-exponent)), clipped for numerical safety
+        clipped_exponent = float(np.clip(raw_exponent, -50.0, 50.0))
+        sigmoid_val = 1.0 / (1.0 + math.exp(-clipped_exponent))
+        return self.hazard_p_max * sigmoid_val
+
+    def _apply_sigmoid_hazard_cancellations(self):
+        """Stochastically cancel active orders based on sigmoid hazard probabilities.
+
+        For each active order in READY or ASSIGNED status (not PICKED_UP), sample
+        a cancellation event this step with probability given by
+        _get_order_cancel_probability().  PICKED_UP orders are not cancelled here
+        because the drone is already en route to the customer.
+        """
+        if not self.enable_sigmoid_hazard_cancellation:
+            return
+
+        current_step = self.time_system.current_step
+        for order_id in list(self.active_orders):
+            if order_id not in self.orders:
+                continue
+            order = self.orders[order_id]
+            if order['status'] not in (OrderStatus.READY, OrderStatus.ASSIGNED):
+                continue
+            prob = self._get_order_cancel_probability(order, current_step)
+            if self.np_random.random() < prob:
+                self._cancel_order(order_id, "stochastic_timeout")
+
     def _cleanup_stale_assignments(self):
         current_step = self.time_system.current_step
         stale_threshold = 50
 
         for order_id, order in list(self.orders.items()):
-            # Check for READY-based timeout cancellation
-            if order['status'] in [OrderStatus.READY, OrderStatus.ASSIGNED, OrderStatus.PICKED_UP]:
-                deadline_step = self._get_delivery_deadline_step(order)
-                if current_step > deadline_step:
-                    self._cancel_order(order_id, "ready_based_timeout")
-                    continue
+            if order_id not in self.active_orders:
+                continue
+
+            # Apply sigmoid hazard cancellations (replaces hard deadline for READY/ASSIGNED).
+            # PICKED_UP orders are not hard-cancelled here either; the hazard method above
+            # already skips them.  If sigmoid hazard is disabled, fall back to the old
+            # deadline-based cancellation for READY and ASSIGNED only.
+            if not self.enable_sigmoid_hazard_cancellation:
+                if order['status'] in [OrderStatus.READY, OrderStatus.ASSIGNED]:
+                    deadline_step = self._get_delivery_deadline_step(order)
+                    if current_step > deadline_step:
+                        self._cancel_order(order_id, "ready_based_timeout")
+                        continue
 
             if order['status'] == OrderStatus.ASSIGNED:
                 drone_id = order.get('assigned_drone', -1)
@@ -4151,6 +4245,9 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         print(f"  完成订单: {self.daily_stats['orders_completed']}")
         print(f"  完成率: {self.daily_stats['orders_completed'] / self.daily_stats['orders_generated']:.2%}")
         print(f"  取消订单: {self.daily_stats['orders_cancelled']}")
+        if self.daily_stats['orders_completed'] > 0:
+            avg_wait = self.daily_stats['total_waiting_time'] / self.daily_stats['orders_completed']
+            print(f"  平均等待时间: {avg_wait:.2f} steps")
         #print(f"  准时交付: {self.daily_stats['on_time_deliveries']}")
 
         # Report legacy blocked count if any
@@ -4688,11 +4785,13 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
             info['on_time_rate'] = self.daily_stats['on_time_deliveries'] / self.daily_stats['orders_completed']
             info['avg_distance_per_order'] = self.daily_stats['total_flight_distance'] / self.daily_stats[
                 'orders_completed']
+            info['avg_waiting_time'] = self.daily_stats['total_waiting_time'] / self.daily_stats['orders_completed']
         else:
             info['avg_delivery_time'] = 0
             info['energy_efficiency'] = 0
             info['on_time_rate'] = 0
             info['avg_distance_per_order'] = 0
+            info['avg_waiting_time'] = 0
 
         return info
 
@@ -4716,6 +4815,10 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                 'resource_utilization': self._calculate_resource_saturation(),
                 'total_flight_distance': self.daily_stats['total_flight_distance'],
                 'optimal_flight_distance': self.daily_stats['optimal_flight_distance'],
+                'avg_waiting_time': (
+                    self.daily_stats['total_waiting_time'] / self.daily_stats['orders_completed']
+                    if self.daily_stats['orders_completed'] > 0 else 0
+                ),
             },
             'drone_status': self._get_drone_status_summary()
         }
