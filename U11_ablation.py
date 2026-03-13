@@ -201,6 +201,7 @@ def run_single_episode(args, order_cutoff_steps: int, seed: int) -> dict:
         policy_fn=policy_fn,
         max_skip_steps=args.max_skip_steps,
         verbose=False,
+        track_action_stats=getattr(args, 'track_action_stats', False),
     )
 
     executor.run_episode(max_steps=args.max_steps, seed=seed)
@@ -208,6 +209,17 @@ def run_single_episode(args, order_cutoff_steps: int, seed: int) -> dict:
     stats = _compute_completion_stats(env)
     stats['order_cutoff_steps'] = order_cutoff_steps
     stats['seed'] = seed
+
+    if getattr(args, 'track_action_stats', False):
+        action_stats = executor.get_action_stats()
+        pct = {k: f'{v:.1f}%' for k, v in action_stats.to_percent().items()}
+        print(f"  [seed={seed} K={order_cutoff_steps}] "
+              f"rule_counts: {dict(action_stats.rule_counts)}  "
+              f"rule_percent: {pct}  "
+              f"n_decisions={action_stats.n_decisions}  "
+              f"n_invalid_rule={action_stats.n_invalid_rule}  "
+              f"n_empty_candidates={action_stats.n_empty_candidates}")
+
     return stats
 
 
@@ -316,15 +328,27 @@ def run_sanity_check(args):
         env=env,
         policy_fn=policy_fn,
         max_skip_steps=args.max_skip_steps,
-        verbose=args.verbose
+        verbose=args.verbose,
     )
 
     # Run episode
-    print("\n" + "=" * 80)
-    print(f"Running episode (max {args.max_steps} decision steps)...")
-    print("=" * 80 + "\n")
 
-    stats = executor.run_episode(max_steps=args.max_steps, seed=args.seed)
+
+    stats = executor.run_episode(max_steps=args.max_steps)
+
+    # Print action stats if tracking is enabled
+    if getattr(args, 'track_action_stats', False):
+        action_stats = executor.get_action_stats()
+        pct = {k: f'{v:.1f}%' for k, v in action_stats.to_percent().items()}
+        print("\n" + "=" * 80)
+        print("Rule Selection Statistics")
+        print("=" * 80)
+        print(f"  rule_counts:          {dict(action_stats.rule_counts)}")
+        print(f"  rule_percent:         {pct}")
+        print(f"  n_decisions:          {action_stats.n_decisions}")
+        print(f"  n_invalid_rule:       {action_stats.n_invalid_rule}")
+        print(f"  n_empty_candidates:   {action_stats.n_empty_candidates}")
+        print("=" * 80)
     '''
     # Print results
     print("\n" + "=" * 80)
@@ -382,7 +406,7 @@ def main():
     parser.add_argument("--num-drones", type=int, default=20,
                         help="Number of drones (default: 10)")
     parser.add_argument("--obs-max-orders", type=int, default=400,
-                        help="Maximum orders in observation (default: 200)")
+                        help="Maximum orders in observation (default: 200)")# 存疑
     parser.add_argument("--top-k-merchants", type=int, default=100,
                         help="Top K merchants (default: 50)")
     parser.add_argument("--candidate-k", type=int, default=20,
@@ -423,6 +447,9 @@ def main():
                         help="Random seed (default: 42)")
     parser.add_argument("--verbose", action="store_true", default=False,
                         help="Print detailed execution logs (default: False)")
+    parser.add_argument("--track-action-stats", action="store_true", default=True,
+                        help="Track and print rule selection distribution after each episode "
+                             "(default: False)")
 
     args = parser.parse_args()
 

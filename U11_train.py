@@ -97,7 +97,7 @@ def make_env(
         drone_sampling: str = 'random',
 ) -> gym.Env:
     """
-    Create U10 environment with MOPSO candidate generation and event-driven wrapper.
+    Create U11 environment with MOPSO candidate generation and event-driven wrapper.
 
     Args:
         seed: Random seed
@@ -293,7 +293,6 @@ def train(args):
     # Print action/observation space info
     print(f"\nAction space: {env.get_attr('action_space')[0]}")
     print(f"Observation space: {env.get_attr('observation_space')[0]}")
-    print()
 
     # Create PPO model with MlpPolicy (flat Box observation)
     model = PPO(
@@ -309,6 +308,7 @@ def train(args):
         verbose=1,
         tensorboard_log=args.log_dir,
         seed=args.seed,
+        device='cuda',
     )
 
     # Checkpoint callback
@@ -344,11 +344,11 @@ def train(args):
 def main():
     """Parse arguments and start training."""
     parser = argparse.ArgumentParser(
-        description="U10 PPO Training with MOPSO Candidate Generation"
+        description="U11 PPO Training with MOPSO Candidate Generation"
     )
 
     # Training parameters
-    parser.add_argument("--total-steps", type=int, default=200000,
+    parser.add_argument("--total-steps", type=int, default=2000000,
                         help="Total training steps (default: 200000)")
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed (default: 42)")
@@ -364,11 +364,11 @@ def main():
     # Environment parameters
     parser.add_argument("--num-drones", type=int, default=20,
                         help="Number of drones (default: 20)")
-    parser.add_argument("--obs-max-orders", type=int, default=400,
+    parser.add_argument("--obs-max-orders", type=int, default=200,
                         help="Maximum orders in observation (default: 400)")
-    parser.add_argument("--top-k-merchants", type=int, default=100,
+    parser.add_argument("--top-k-merchants", type=int, default=50,
                         help="Top K merchants (default: 100)")
-    parser.add_argument("--candidate-k", type=int, default=20,
+    parser.add_argument("--candidate-k", type=int, default=10,
                         help="Number of candidates per drone (default: 20)")
     parser.add_argument("--rule-count", type=int, default=5,
                         help="Number of rules for action space (default: 5)")
@@ -384,11 +384,11 @@ def main():
     # Candidate generation parameters
     parser.add_argument("--candidate-update-interval", type=int, default=8,
                         help="Candidate refresh interval (0=only on reset, default: 8)")
-    parser.add_argument("--mopso-n-particles", type=int, default=30,
+    parser.add_argument("--mopso-n-particles", type=int, default=10,
                         help="MOPSO particle count (default: 30)")
-    parser.add_argument("--mopso-n-iterations", type=int, default=10,
+    parser.add_argument("--mopso-n-iterations", type=int, default=3,
                         help="MOPSO iteration count (default: 10)")
-    parser.add_argument("--mopso-max-orders", type=int, default=200,
+    parser.add_argument("--mopso-max-orders", type=int, default=100,
                         help="Max orders for MOPSO (default: 200)")
     parser.add_argument("--mopso-max-orders-per-drone", type=int, default=10,
                         help="Max orders per drone in MOPSO (default: 10)")
@@ -426,10 +426,10 @@ def main():
     # Saving
     parser.add_argument("--save-freq", type=int, default=10000,
                         help="Checkpoint save frequency (default: 10000)")
-    parser.add_argument("--log-dir", type=str, default="./logs/u10",
-                        help="TensorBoard log directory (default: ./logs/u10)")
-    parser.add_argument("--model-dir", type=str, default="./models/u10",
-                        help="Model save directory (default: ./models/u10)")
+    parser.add_argument("--log-dir", type=str, default="./logs/u11",
+                        help="TensorBoard log directory (default: ./logs/u11)")
+    parser.add_argument("--model-dir", type=str, default="./models/u11",
+                        help="Model save directory (default: ./models/u11)")
 
     args = parser.parse_args()
     train(args)

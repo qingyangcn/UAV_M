@@ -315,6 +315,9 @@ class SingleUAVTrainingWrapper(gym.Wrapper):
         state_dim = self.observation_space.shape[0]
 
         if drone_id is None:
-            return np.zeros(state_dim, dtype=np.float32)
+            obs = np.zeros(state_dim, dtype=np.float32)
+        else:
+            obs = self.env.unwrapped._get_rule_based_state_for_drone(drone_id)
 
-        return self.env.unwrapped._get_rule_based_state_for_drone(drone_id)
+
+        return obs
