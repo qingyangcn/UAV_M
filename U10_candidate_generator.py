@@ -75,6 +75,8 @@ class NearestCandidateGenerator(CandidateGenerator):
         """
         For each drone, select K nearest orders by pickup location distance.
 
+        Uses NumPy vectorized distance computation to avoid per-order scalar loops.
+
         Args:
             env: The UAV environment instance
 
@@ -84,23 +86,40 @@ class NearestCandidateGenerator(CandidateGenerator):
         candidates = {}
         active_orders = self._get_active_orders(env)
 
+        # Pre-build order arrays once for all drones
+        order_ids = []
+        merchant_coords = []
+        for order_id in active_orders:
+            order = env.orders.get(order_id)
+            if order is None:
+                continue
+            order_ids.append(order_id)
+            merchant_coords.append(order['merchant_location'])
+
+        if not order_ids:
+            for drone_id in range(env.num_drones):
+                candidates[drone_id] = []
+            return candidates
+
+        # Shape: (N, 2)
+        merchant_arr = np.array(merchant_coords, dtype=np.float32)
+
         for drone_id in range(env.num_drones):
-            drone = env.drones[drone_id]
-            drone_loc = drone['location']
+            drone_loc = env.drones[drone_id]['location']
+            # Vectorized distance: broadcast subtract + L2 norm
+            drone_arr = np.array(drone_loc, dtype=np.float32)
+            diffs = merchant_arr - drone_arr  # (N, 2)
+            dists = np.hypot(diffs[:, 0], diffs[:, 1])  # (N,)
 
-            # Calculate distances to all active orders
-            order_distances = []
-            for order_id in active_orders:
-                if order_id not in env.orders:
-                    continue
-                order = env.orders[order_id]
-                merchant_loc = order['merchant_location']
-                distance = self._calculate_distance(drone_loc, merchant_loc)
-                order_distances.append((order_id, distance))
+            k = min(self.candidate_k, len(order_ids))
+            # argpartition is O(N) vs O(N log N) for a full sort
+            if k < len(order_ids):
+                top_idx = np.argpartition(dists, k)[:k]
+                top_idx = top_idx[np.argsort(dists[top_idx])]
+            else:
+                top_idx = np.argsort(dists)
 
-            # Sort by distance and take top K
-            order_distances.sort(key=lambda x: x[1])
-            candidates[drone_id] = [oid for oid, _ in order_distances[:self.candidate_k]]
+            candidates[drone_id] = [order_ids[i] for i in top_idx]
 
         return candidates
 
@@ -177,8 +196,10 @@ class MixedHeuristicCandidateGenerator(CandidateGenerator):
         """
         For each drone, select K orders based on weighted distance and deadline.
 
-        Score = distance_weight * normalized_distance + deadline_weight * normalized_slack
+        Score = distance_weight * normalized_distance + deadline_weight * normalized_urgency
         Lower score is better.
+
+        Uses NumPy vectorized distance and scoring to avoid per-order scalar loops.
 
         Args:
             env: The UAV environment instance
@@ -190,64 +211,56 @@ class MixedHeuristicCandidateGenerator(CandidateGenerator):
         active_orders = self._get_active_orders(env)
         current_step = env.time_system.current_step
 
-        for drone_id in range(env.num_drones):
-            drone = env.drones[drone_id]
-            drone_loc = drone['location']
-
-            # Calculate scores for all active orders
-            order_scores = []
-
-            # First pass: collect raw values for normalization
-            distances = []
-            slacks = []
-            for order_id in active_orders:
-                if order_id not in env.orders:
-                    continue
-                order = env.orders[order_id]
-                merchant_loc = order['merchant_location']
-                distance = self._calculate_distance(drone_loc, merchant_loc)
-                deadline = env._get_delivery_deadline_step(order)
-                slack = deadline - current_step
-
-                distances.append(distance)
-                slacks.append(slack)
-
-            if not distances:
-                candidates[drone_id] = []
+        # Pre-build arrays once for all drones
+        order_ids = []
+        merchant_coords = []
+        slacks = []
+        for order_id in active_orders:
+            order = env.orders.get(order_id)
+            if order is None:
                 continue
+            deadline = env._get_delivery_deadline_step(order)
+            order_ids.append(order_id)
+            merchant_coords.append(order['merchant_location'])
+            slacks.append(float(deadline - current_step))
 
-            # Normalize
-            max_dist = max(distances) if distances else 1.0
-            max_slack = max(slacks) if slacks else 1.0
-            min_dist = min(distances) if distances else 0.0
-            min_slack = min(slacks) if slacks else 0.0
+        if not order_ids:
+            for drone_id in range(env.num_drones):
+                candidates[drone_id] = []
+            return candidates
 
+        merchant_arr = np.array(merchant_coords, dtype=np.float32)  # (N, 2)
+        slacks_arr = np.array(slacks, dtype=np.float32)              # (N,)
+
+        # Normalize slacks once (shared across all drones)
+        min_slack = slacks_arr.min()
+        max_slack = slacks_arr.max()
+        slack_range = max_slack - min_slack if max_slack > min_slack else 1.0
+        # Higher urgency = lower slack; invert so urgent orders score lower
+        norm_urgency = 1.0 - (slacks_arr - min_slack) / slack_range  # (N,)
+
+        for drone_id in range(env.num_drones):
+            drone_loc = env.drones[drone_id]['location']
+            drone_arr = np.array(drone_loc, dtype=np.float32)
+            diffs = merchant_arr - drone_arr          # (N, 2)
+            dists = np.hypot(diffs[:, 0], diffs[:, 1])  # (N,)
+
+            min_dist = dists.min()
+            max_dist = dists.max()
             dist_range = max_dist - min_dist if max_dist > min_dist else 1.0
-            slack_range = max_slack - min_slack if max_slack > min_slack else 1.0
+            norm_dist = (dists - min_dist) / dist_range  # (N,)
 
-            # Second pass: calculate normalized scores
-            idx = 0
-            for order_id in active_orders:
-                if order_id not in env.orders:
-                    continue
+            scores = (self.distance_weight * norm_dist +
+                      self.deadline_weight * norm_urgency)  # (N,)
 
-                # Normalize distance (0-1, lower is better)
-                norm_distance = (distances[idx] - min_dist) / dist_range
+            k = min(self.candidate_k, len(order_ids))
+            if k < len(order_ids):
+                top_idx = np.argpartition(scores, k)[:k]
+                top_idx = top_idx[np.argsort(scores[top_idx])]
+            else:
+                top_idx = np.argsort(scores)
 
-                # Normalize slack (0-1, higher slack is worse for urgency)
-                # Invert so that lower slack (more urgent) gets higher priority
-                norm_urgency = 1.0 - ((slacks[idx] - min_slack) / slack_range)
-
-                # Combined score (lower is better)
-                score = (self.distance_weight * norm_distance +
-                         self.deadline_weight * norm_urgency)
-
-                order_scores.append((order_id, score))
-                idx += 1
-
-            # Sort by score and take top K
-            order_scores.sort(key=lambda x: x[1])
-            candidates[drone_id] = [oid for oid, _ in order_scores[:self.candidate_k]]
+            candidates[drone_id] = [order_ids[i] for i in top_idx]
 
         return candidates
 
@@ -461,7 +474,7 @@ class MOPSOCandidateGenerator(CandidateGenerator):
         """
         Pad candidate list with heuristic choices when MOPSO returns insufficient candidates.
 
-        Uses nearest distance heuristic to fill remaining slots.
+        Uses vectorized nearest-distance heuristic to fill remaining slots.
 
         Args:
             env: Environment instance
@@ -473,32 +486,37 @@ class MOPSOCandidateGenerator(CandidateGenerator):
         Returns:
             Padded list of candidate order IDs
         """
-        drone = env.drones[drone_id]
-        drone_loc = drone['location']
+        need = self.candidate_k - len(current_candidates)
+        if need <= 0:
+            return current_candidates[:self.candidate_k]
 
-        # Calculate distances to all remaining ready orders
-        order_distances = []
-        for oid in ready_order_ids:
-            if oid in seen_orders:
-                continue
+        # Collect unseen ready orders
+        remaining_ids = [oid for oid in ready_order_ids if oid not in seen_orders
+                         and env.orders.get(oid) is not None]
 
-            # Safely access order
-            order = env.orders.get(oid)
-            if order is None:
-                continue
+        if not remaining_ids:
+            return current_candidates
 
-            merchant_loc = order['merchant_location']
-            distance = self._calculate_distance(drone_loc, merchant_loc)
-            order_distances.append((oid, distance))
+        drone_loc = env.drones[drone_id]['location']
+        drone_arr = np.array(drone_loc, dtype=np.float32)
 
-        # Sort by distance
-        order_distances.sort(key=lambda x: x[1])
+        # Vectorized distance calculation
+        merchant_coords = [env.orders[oid]['merchant_location'] for oid in remaining_ids]
+        merchant_arr = np.array(merchant_coords, dtype=np.float32)  # (M, 2)
+        diffs = merchant_arr - drone_arr                             # (M, 2)
+        dists = np.hypot(diffs[:, 0], diffs[:, 1])                  # (M,)
 
-        # Add nearest orders until we have K candidates
+        # Take the nearest `need` orders
+        k = min(need, len(remaining_ids))
+        if k < len(remaining_ids):
+            top_idx = np.argpartition(dists, k)[:k]
+            top_idx = top_idx[np.argsort(dists[top_idx])]
+        else:
+            top_idx = np.argsort(dists)
+
         padded_candidates = current_candidates.copy()
-        for oid, _ in order_distances:
-            if len(padded_candidates) >= self.candidate_k:
-                break
+        for i in top_idx:
+            oid = remaining_ids[i]
             padded_candidates.append(oid)
             seen_orders.add(oid)
 
