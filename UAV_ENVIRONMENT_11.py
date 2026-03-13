@@ -3,8 +3,9 @@ import numpy as np
 import gymnasium as gym
 from gymnasium import spaces
 import random
+import time
 from enum import Enum
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Set
 from collections import defaultdict, deque
 import matplotlib.pyplot as plt
 import math
@@ -145,7 +146,8 @@ class StateManager:
 
     def __init__(self, env):
         self.env = env
-        self.state_log = []
+        # Bounded deque to prevent unbounded GC pressure over long training runs
+        self.state_log = deque(maxlen=5000)
 
     def update_order_status(self, order_id, new_status, reason=""):
         """统一更新订单状态"""
@@ -160,6 +162,13 @@ class StateManager:
         if new_status == OrderStatus.READY and old_status != OrderStatus.READY:
             if order.get('ready_step') is None:
                 order['ready_step'] = self.env.time_system.current_step
+
+        # Maintain incremental ready-orders cache (avoids full active_orders scan)
+        cache = self.env._ready_orders_cache
+        if new_status == OrderStatus.READY:
+            cache.add(order_id)
+        elif old_status == OrderStatus.READY:
+            cache.discard(order_id)
 
         # 记录状态变更
         state_change = {
@@ -337,22 +346,16 @@ class StateManager:
 class PathVisualizer:
     def __init__(self, grid_size):
         self.grid_size = grid_size
-        self.path_history = defaultdict(list)
+        # deque(maxlen=100) per drone: O(1) append/eviction, bounded memory
+        self.path_history = defaultdict(lambda: deque(maxlen=100))
         self.planned_paths = {}
 
     def update_path_history(self, drone_id, location):
         """更新无人机路径历史"""
-        if drone_id not in self.path_history:
-            self.path_history[drone_id] = []
-
+        hist = self.path_history[drone_id]
         # 只记录位置变化
-        if (not self.path_history[drone_id] or
-                self.path_history[drone_id][-1] != location):
-            self.path_history[drone_id].append(location)
-
-        # 限制历史长度
-        if len(self.path_history[drone_id]) > 100:
-            self.path_history[drone_id].pop(0)
+        if not hist or hist[-1] != location:
+            hist.append(location)
 
     def update_planned_path(self, drone_id, current_loc, target_loc, route_preferences=None):
         """更新规划路径"""
@@ -1165,6 +1168,8 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         self.candidate_generator = None
         # Filtered candidate sets: {drone_id: [order_id, ...]}
         self.filtered_candidates = {}
+        # Cached set version of filtered_candidates for O(1) membership tests
+        self._filtered_candidates_sets: Dict[int, set] = {}
 
         # ========== 多目标训练方式 ==========
         self.multi_objective_mode = multi_objective_mode
@@ -1279,6 +1284,8 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         self.obs_num_merchants = int(min(self.top_k_merchants, len(self.merchants)))
 
         # 状态管理器（放在 spaces 前后都行；这里放前面便于后续 reset/生成时用）
+        # Initialize _ready_orders_cache before StateManager so update_order_status can use it
+        self._ready_orders_cache: set = set()
         self.state_manager = StateManager(self)
 
         # 定义 spaces：只使用固定 shape
@@ -1323,15 +1330,28 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                 'rainy_deliveries': 0,
                 'windy_deliveries': 0,
                 'extreme_deliveries': 0
-            }
+            },
+            # Bounded deques to prevent unbounded growth of sample lists
+            'assignment_slack_samples': deque(maxlen=2000),
+            'ready_based_lateness_samples': deque(maxlen=2000),
         }
 
-        # 事件/历史
+        # 事件/历史 - 使用有界 deque 防止长训练时内存无限增长
         self.event_queue = deque()
-        self.order_history = []
-        self.weather_history = []
-        self.pareto_history = []
+        self.order_history = deque(maxlen=1000)
+        self.weather_history = deque(maxlen=200)
+        self.pareto_history = deque(maxlen=200)
         self.weather = WeatherType.SUNNY
+
+        # Running stats for order_history summary (O(1) in _get_info)
+        self._order_hist_merchant_ids: set = set()
+        self._order_hist_dist_sum: float = 0.0
+        self._order_hist_dist_count: int = 0
+
+        # Lightweight per-step timing accumulators (active only when enable_diagnostics=True)
+        # Keys: 'candidate_update', 'event_processing', 'position_update', 'observation_build'
+        self._perf_accum: Dict[str, float] = {}
+        self._perf_steps: int = 0
 
         # Decision tracking for decentralized execution
         self.last_decision_info = {
@@ -1686,9 +1706,77 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         return encoding
 
     def _update_candidate_mappings(self):
-        """Update candidate mappings for all drones. Called each step."""
-        for drone_id in range(self.num_drones):
-            self.drone_candidate_mappings[drone_id] = self._build_candidate_list_for_drone(drone_id)
+        """Update candidate mappings for all drones.
+
+        Optimized: single pass over active_orders collects assigned/ready sets,
+        then builds per-drone candidate lists. Replaces the previous O(D*N) approach
+        of calling _build_candidate_list_for_drone separately for each drone.
+        """
+        K = self.num_candidates
+        current_step = self.time_system.current_step
+        num_drones = self.num_drones
+
+        # Single pass over active_orders: gather assigned-per-drone and ready pool
+        assigned_by_drone: Dict[int, List[int]] = {d: [] for d in range(num_drones)}
+        ready_pool: List[int] = []
+
+        for oid in self.active_orders:
+            order = self.orders.get(oid)
+            if order is None:
+                continue
+            status = order['status']
+            if status == OrderStatus.ASSIGNED:
+                d = order.get('assigned_drone', -1)
+                # Use -1 as the unassigned sentinel throughout
+                if d is not None and d >= 0 and d < num_drones:
+                    assigned_by_drone[d].append(oid)
+            elif status == OrderStatus.READY:
+                if order.get('assigned_drone', -1) in (-1, None):
+                    ready_pool.append(oid)
+
+        # Sort READY orders once (shared across all drones)
+        def _ready_priority(oid):
+            o = self.orders[oid]
+            urgent_score = 1000 if o.get('urgent', False) else 0
+            age = current_step - o['creation_time']
+            return -(urgent_score + age)
+
+        ready_pool.sort(key=_ready_priority)
+
+        # Build per-drone candidate lists
+        for drone_id in range(num_drones):
+            drone = self.drones[drone_id]
+            candidates: List[Tuple[int, bool]] = []
+            seen_ids: set = set()
+
+            # 1. Orders already in cargo (PICKED_UP)
+            for oid in drone.get('cargo', set()):
+                order = self.orders.get(oid)
+                if order and order['status'] == OrderStatus.PICKED_UP:
+                    candidates.append((oid, True))
+                    seen_ids.add(oid)
+
+            # 2. Orders ASSIGNED to this drone (not yet picked up)
+            for oid in assigned_by_drone[drone_id]:
+                if len(candidates) >= K:
+                    break
+                if oid not in seen_ids:
+                    candidates.append((oid, True))
+                    seen_ids.add(oid)
+
+            # 3. READY orders available for PPO selection
+            for oid in ready_pool:
+                if len(candidates) >= K:
+                    break
+                if oid not in seen_ids:
+                    candidates.append((oid, True))
+                    seen_ids.add(oid)
+
+            # 4. Pad with invalid entries
+            while len(candidates) < K:
+                candidates.append((-1, False))
+
+            self.drone_candidate_mappings[drone_id] = candidates[:K]
 
     # ------------------ reset / step ------------------
 
@@ -1710,6 +1798,17 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         self.completed_orders = set()
         self.cancelled_orders = set()
         self.global_order_counter = 0
+
+        # Reset incremental caches that depend on order state
+        self._ready_orders_cache = set()
+        self._filtered_candidates_sets = {}
+        # Reset running order-history stats
+        self._order_hist_merchant_ids = set()
+        self._order_hist_dist_sum = 0.0
+        self._order_hist_dist_count = 0
+        # Reset per-step profiling accumulators
+        self._perf_accum = {}
+        self._perf_steps = 0
 
         self._reset_drones_and_bases()
         self._reset_daily_stats()
@@ -1784,6 +1883,9 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         self._assigned_in_step = set()
         self._last_route_heading = action
 
+        _profile = self.enable_diagnostics
+        _t0 = time.perf_counter() if _profile else 0.0
+
         day_ended = self.time_system.step()
         time_state = self.time_system.get_time_state()
 
@@ -1792,9 +1894,11 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
             self._update_weather_from_dataset()
 
         # U7: Update candidate mappings before processing action
+        _t1 = time.perf_counter() if _profile else 0.0
         self._update_candidate_mappings()
 
         # U9: Update filtered candidates based on interval
+        _t2 = time.perf_counter() if _profile else 0.0
         if self.candidate_update_interval > 0:
             if self.time_system.current_step % self.candidate_update_interval == 0:
                 self.update_filtered_candidates()
@@ -1819,6 +1923,7 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         self.last_step_reward_components['obj2_total'] = float(r_vec[2])
 
         # 动态事件 (includes position update and merchant preparation)
+        _t3 = time.perf_counter() if _profile else 0.0
         self._process_events()
 
         # 随机 sigmoid hazard 取消
@@ -1849,12 +1954,20 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         if self.time_system.current_step % 4 == 0:
             self._monitor_drone_status()
 
+        # 更新帕累托前沿
+        self.pareto_optimizer.update_pareto_front(r_vec)
+
+        # Collect profiling stats
+        if _profile:
+            _t4 = time.perf_counter()
+            _pa = self._perf_accum
+            _pa['candidate_update'] = _pa.get('candidate_update', 0.0) + (_t2 - _t1)
+            _pa['event_processing'] = _pa.get('event_processing', 0.0) + (_t4 - _t3)
+            self._perf_steps += 1
+
         # Print diagnostics if enabled
         if self.enable_diagnostics and self.time_system.current_step % self.diagnostics_interval == 0:
             self._print_diagnostics()
-
-        # 更新帕累托前沿
-        self.pareto_optimizer.update_pareto_front(r_vec)
 
         # ---- 原逻辑：termination + final bonus ----
         terminated = self._check_termination(day_ended)
@@ -2164,14 +2277,18 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                 else:
                     self._clear_drone_batch_state(drone)
 
-            actual_load = 0
-            for order_id in self.active_orders:
-                if order_id in self.orders:
-                    order = self.orders[order_id]
-                    if (order.get('assigned_drone') == drone_id and
-                            order['status'] in [OrderStatus.ASSIGNED, OrderStatus.PICKED_UP]):
-                        actual_load += 1
-            drone['current_load'] = actual_load
+        # Single-pass load recalculation: O(N+D) instead of O(D*N)
+        load_counts = {d_id: 0 for d_id in self.drones}
+        for order_id in self.active_orders:
+            order = self.orders.get(order_id)
+            if order is None:
+                continue
+            if order['status'] in (OrderStatus.ASSIGNED, OrderStatus.PICKED_UP):
+                d = order.get('assigned_drone')
+                if d is not None and d >= 0 and d in load_counts:
+                    load_counts[d] += 1
+        for drone_id, drone in self.drones.items():
+            drone['current_load'] = load_counts[drone_id]
 
     def _clear_drone_batch_state(self, drone):
         keys_to_remove = ['batch_orders', 'current_batch_index', 'current_delivery_index', 'waiting_start_time']
@@ -2820,8 +2937,6 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
             # Record READY-based assignment slack for diagnostics
             deadline_step = self._get_delivery_deadline_step(o)
             assignment_slack = deadline_step - self.time_system.current_step
-            if 'assignment_slack_samples' not in self.metrics:
-                self.metrics['assignment_slack_samples'] = []
             self.metrics['assignment_slack_samples'].append(assignment_slack)
 
         if not committed:
@@ -2925,8 +3040,6 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
             # Record READY-based assignment slack for diagnostics
             deadline_step = self._get_delivery_deadline_step(o)
             assignment_slack = deadline_step - self.time_system.current_step
-            if 'assignment_slack_samples' not in self.metrics:
-                self.metrics['assignment_slack_samples'] = []
             self.metrics['assignment_slack_samples'].append(assignment_slack)
 
         if not committed:
@@ -3049,8 +3162,6 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         # Record READY-based assignment slack for diagnostics
         deadline_step = self._get_delivery_deadline_step(order)
         assignment_slack = deadline_step - self.time_system.current_step
-        if 'assignment_slack_samples' not in self.metrics:
-            self.metrics['assignment_slack_samples'] = []
         self.metrics['assignment_slack_samples'].append(assignment_slack)
 
         target_merchant_loc = order['merchant_location']
@@ -3735,8 +3846,6 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         delivery_lateness = self._calculate_delivery_lateness(order)
 
         # Record lateness for diagnostics
-        if 'ready_based_lateness_samples' not in self.metrics:
-            self.metrics['ready_based_lateness_samples'] = []
         self.metrics['ready_based_lateness_samples'].append(delivery_lateness)
 
         # Check if delivery was on-time using helper method
@@ -3829,7 +3938,9 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
 
             # Release ASSIGNED orders (not yet picked up)
             if order['status'] == OrderStatus.ASSIGNED:
-                order['status'] = OrderStatus.READY
+                self.state_manager.update_order_status(
+                    order_id, OrderStatus.READY, reason="force_return_low_battery"
+                )
                 order['assigned_drone'] = None
                 # Clear assignment timestamp if present
                 if 'assigned_time' in order:
@@ -3838,7 +3949,9 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
             # Release PICKED_UP orders (in cargo but not delivered)
             # In paper-level simplification, allow "delivery failure recovery"
             elif order['status'] == OrderStatus.PICKED_UP:
-                order['status'] = OrderStatus.READY
+                self.state_manager.update_order_status(
+                    order_id, OrderStatus.READY, reason="force_return_low_battery_pickup"
+                )
                 order['assigned_drone'] = None
                 # Clear pickup timestamp
                 if 'pickup_time' in order:
@@ -4109,13 +4222,18 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
             # PENDING -> ACCEPTED
             self.state_manager.update_order_status(order_id, OrderStatus.ACCEPTED, reason="order_created_and_accepted")
 
+            dist = self._calculate_euclidean_distance(merchant_loc, customer_loc)
             self.order_history.append({
                 'time': self.time_system.current_step,
                 'weather': weather_summary,
                 'order_type': order_details['order_type'],
-                'distance': self._calculate_euclidean_distance(merchant_loc, customer_loc),
+                'distance': dist,
                 'merchant_id': merchant_id
             })
+            # Update O(1) running stats (avoids per-step O(N) scan in _get_info)
+            self._order_hist_merchant_ids.add(merchant_id)
+            self._order_hist_dist_sum += dist
+            self._order_hist_dist_count += 1
 
         except Exception as e:
             print(f"生成订单详细时出错: {e}")
@@ -4207,8 +4325,10 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         current_step = self.time_system.current_step
         stale_threshold = 50
 
-        for order_id, order in list(self.orders.items()):
-            if order_id not in self.active_orders:
+        # Iterate active_orders directly (avoids scanning completed/cancelled orders)
+        for order_id in list(self.active_orders):
+            order = self.orders.get(order_id)
+            if order is None:
                 continue
 
             # Apply sigmoid hazard cancellations (replaces hard deadline for READY/ASSIGNED).
@@ -4725,14 +4845,23 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         else:
             print(f"  Legacy fallback: ENABLED")
 
-        # Order stats
-        ready_count = sum(1 for oid in self.active_orders if self.orders[oid]['status'] == OrderStatus.READY)
+        # Order stats - use incremental cache (always maintained, even when empty)
+        ready_count = len(self._ready_orders_cache)
         assigned_count = sum(1 for oid in self.active_orders if self.orders[oid]['status'] == OrderStatus.ASSIGNED)
         picked_up_count = sum(1 for oid in self.active_orders if self.orders[oid]['status'] == OrderStatus.PICKED_UP)
 
         print(f"  Orders: READY={ready_count}, ASSIGNED={assigned_count}, PICKED_UP={picked_up_count}")
         print(
             f"  Orders completed: {self.daily_stats['orders_completed']}, cancelled: {self.daily_stats['orders_cancelled']}")
+
+        # Per-step performance summary (D: lightweight profiling)
+        if self._perf_steps > 0:
+            n = self._perf_steps
+            pa = self._perf_accum
+            print(f"\n  --- Avg Per-Step Timings ({n} steps) ---")
+            for key in ('candidate_update', 'event_processing'):
+                avg_ms = pa.get(key, 0.0) / n * 1000.0
+                print(f"    {key}: {avg_ms:.2f} ms/step")
 
         # Reward component breakdown (new diagnostic)
         print(f"\n  --- Reward Components (Last Step) ---")
@@ -4761,9 +4890,11 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
             'pareto_hypervolume': self.pareto_optimizer.calculate_hypervolume(np.ones(self.num_objectives) * 0.5),
             'pareto_diversity': self.pareto_optimizer.get_diversity(),
             'order_history_summary': {
-                'total_orders': len(self.order_history),
-                'unique_merchants': len(set([o['merchant_id'] for o in self.order_history])),
-                'avg_distance': np.mean([o['distance'] for o in self.order_history]) if self.order_history else 0
+                # O(1): use running stats updated when orders are appended
+                'total_orders': self._order_hist_dist_count,
+                'unique_merchants': len(self._order_hist_merchant_ids),
+                'avg_distance': (self._order_hist_dist_sum / self._order_hist_dist_count
+                                 if self._order_hist_dist_count > 0 else 0)
             },
             'time_state': self.time_system.get_time_state(),
             'backlog_size': len(self.active_orders),
@@ -4864,9 +4995,12 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         """
         Get snapshot of READY orders for MOPSO scheduling.
         Returns list of order dicts with essential fields.
+
+        Uses incremental _ready_orders_cache to avoid full active_orders scan.
         """
         ready_orders = []
-        for oid in self.active_orders:
+        # _ready_orders_cache is always maintained by StateManager; use it directly
+        for oid in self._ready_orders_cache:
             if oid not in self.orders:
                 continue
             order = self.orders[oid]
@@ -4978,10 +5112,16 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         """
         if self.candidate_generator is None:
             self.filtered_candidates = {}
+            self._filtered_candidates_sets = {}
             return
 
         # Generate candidates using the external generator
         self.filtered_candidates = self.candidate_generator.generate_candidates(self)
+        # Build cached set version for O(1) membership tests in _get_candidate_constrained_orders
+        self._filtered_candidates_sets = {
+            drone_id: set(order_list)
+            for drone_id, order_list in self.filtered_candidates.items()
+        }
 
     def get_filtered_candidates_for_drone(self, drone_id: int) -> List[int]:
         """
@@ -5008,14 +5148,15 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
             Filtered list of order IDs that are in candidates[drone_id] ∩ order_ids
             If candidate_fallback_enabled and no candidates, returns original order_ids
         """
-        candidates = self.get_filtered_candidates_for_drone(drone_id)
+        # Use cached set for O(1) membership test (rebuilt by update_filtered_candidates)
+        candidate_set = self._filtered_candidates_sets.get(drone_id)
 
         # If no candidates and fallback is enabled, return all orders
-        if not candidates and self.candidate_fallback_enabled:
-            return order_ids
+        if not candidate_set:
+            if self.candidate_fallback_enabled:
+                return order_ids
+            return []
 
-        # Filter to candidates only
-        candidate_set = set(candidates)
         return [oid for oid in order_ids if oid in candidate_set]
 
     # ================ U9: Event-driven single UAV decision support ================
