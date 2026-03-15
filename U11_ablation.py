@@ -37,6 +37,7 @@ from U11_decentralized_execution import DecentralizedEventDrivenExecutor
 
 try:
     from U10_candidate_generator import MOPSOCandidateGenerator
+
     _HAS_MOPSO = True
 except ImportError:
     _HAS_MOPSO = False
@@ -333,68 +334,8 @@ def run_sanity_check(args):
 
     # Run episode
 
-
     stats = executor.run_episode(max_steps=args.max_steps)
 
-    # Print action stats if tracking is enabled
-    if getattr(args, 'track_action_stats', False):
-        action_stats = executor.get_action_stats()
-        pct = {k: f'{v:.1f}%' for k, v in action_stats.to_percent().items()}
-        print("\n" + "=" * 80)
-        print("Rule Selection Statistics")
-        print("=" * 80)
-        print(f"  rule_counts:          {dict(action_stats.rule_counts)}")
-        print(f"  rule_percent:         {pct}")
-        print(f"  n_decisions:          {action_stats.n_decisions}")
-        print(f"  n_invalid_rule:       {action_stats.n_invalid_rule}")
-        print(f"  n_empty_candidates:   {action_stats.n_empty_candidates}")
-        print("=" * 80)
-    '''
-    # Print results
-    print("\n" + "=" * 80)
-    print("Sanity Check Results")
-    print("=" * 80)
-    print(f"\nPolicy: {policy_name}")
-    print(f"Environment: {args.num_drones} drones, {args.candidate_k} candidates/drone")
-    print(f"\nExecution Statistics:")
-    print(f"  Decision Rounds:          {stats['decision_rounds']}")
-    print(f"  Individual Decisions:     {stats['individual_decisions']}")
-    print(f"  Actionable Decisions:     {stats['actionable_decisions']}  (order selected, commit attempted)")
-    print(f"  Noop / Not Eligible:      {stats['noop_or_not_eligible']}  (no candidates, drone full, etc.)")
-    print(f"  Commit Success:           {stats['commit_success']}")
-    print(f"  Commit Fail (total):      {stats['failed_decisions'] - stats['noop_or_not_eligible']}")
-    print(f"  Overall Success Rate:     {stats['success_rate']:.2%}  (commit_success / individual_decisions)")
-    print(f"  Total Skip Steps:         {stats['total_skip_steps']}")
-    print(f"  Cumulative Reward:        {stats['cumulative_reward']:.2f}")
-
-    if stats['commit_fail_by_reason']:
-        print(f"\nCommit Failure Reasons:")
-        for reason, count in sorted(stats['commit_fail_by_reason'].items(),
-                                    key=lambda x: -x[1]):
-            print(f"  {reason}: {count}")
-    elif stats['failure_reasons']:
-        print(f"\nFailure Reasons (legacy):")
-        for reason, count in sorted(stats['failure_reasons'].items(),
-                                    key=lambda x: -x[1]):
-            print(f"  {reason}: {count}")
-
-    # Completion stats
-    completion = _compute_completion_stats(env)
-    print(f"\nCompletion Statistics:")
-    print(f"  Generated Total:          {completion['generated_total']}")
-    print(f"  Completed Total:          {completion['completed_total']}")
-    print(f"  General Completion:       {completion['general_completion']:.4f}")
-
-    if stats['total_decisions'] == 0:
-        print("\n⚠ WARNING: No decisions were made during the episode!")
-        print("  This might indicate an issue with decision point detection.")
-
-    if stats['success_rate'] < 0.1:
-        print("\n⚠ WARNING: Very low success rate!")
-        print("  This might indicate issues with order availability or drone capacity.")
-
-    print("\n" + "=" * 80)
-    '''
 
 def main():
     """Parse arguments and run sanity check."""
@@ -403,10 +344,10 @@ def main():
     )
 
     # Environment parameters
-    parser.add_argument("--num-drones", type=int, default=20,
+    parser.add_argument("--num-drones", type=int, default=10,
                         help="Number of drones (default: 10)")
     parser.add_argument("--obs-max-orders", type=int, default=400,
-                        help="Maximum orders in observation (default: 200)")# 存疑
+                        help="Maximum orders in observation (default: 200)")
     parser.add_argument("--top-k-merchants", type=int, default=100,
                         help="Top K merchants (default: 50)")
     parser.add_argument("--candidate-k", type=int, default=20,
@@ -421,9 +362,9 @@ def main():
                         help="Maximum decision steps per episode (default: 500)")
 
     # Policy parameters
-    parser.add_argument("--model-path", type=str, default='ppo_u11_final.zip',
+    parser.add_argument("--model-path", type=str, default='ppo_u11_790000_steps.zip',
                         help="Path to trained model (.zip file) - if not provided, uses random policy")
-    parser.add_argument("--vecnormalize-path", type=str, default='vecnormalize_u11_final.pkl',
+    parser.add_argument("--vecnormalize-path", type=str, default='ppo_u11_vecnormalize_790000_steps.pkl',
                         help="Path to VecNormalize stats (.pkl file)")
 
     # Order cutoff parameter
