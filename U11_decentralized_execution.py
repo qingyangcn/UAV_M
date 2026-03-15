@@ -23,9 +23,28 @@ Usage:
         done = terminated or truncated
 """
 
+import random
+from collections import Counter
 from typing import Dict, List, Optional, Any, Tuple, Callable
 import numpy as np
 import gymnasium as gym
+
+
+class ActionStats:
+    """Per-episode action-selection statistics, collected when track_action_stats=True."""
+
+    def __init__(self):
+        self.rule_counts: Counter = Counter()
+        self.n_decisions: int = 0
+        self.n_invalid_rule: int = 0
+        self.n_empty_candidates: int = 0
+
+    def to_percent(self) -> dict:
+        """Return each rule's share of all tracked decisions as a percentage."""
+        total = sum(self.rule_counts.values())
+        if total == 0:
+            return {i: 0.0 for i in range(5)}
+        return {k: 100.0 * v / total for k, v in self.rule_counts.items()}
 
 
 class DecentralizedEventDrivenExecutor:
@@ -43,6 +62,8 @@ class DecentralizedEventDrivenExecutor:
         policy_fn: Function that takes local_obs and returns rule_id (0-4)
         max_skip_steps: Maximum steps to skip when waiting for decisions
         verbose: Whether to print execution details
+        track_action_stats: When True, collect per-rule selection statistics accessible
+            via get_action_stats().  Defaults to False to preserve existing behaviour.
     """
 
     def __init__(
@@ -50,12 +71,14 @@ class DecentralizedEventDrivenExecutor:
             env: gym.Env,
             policy_fn: Callable[[Dict], int],
             max_skip_steps: int = 10,
-            verbose: bool = False
+            verbose: bool = False,
+            track_action_stats: bool = False,
     ):
         self.env = env
         self.policy_fn = policy_fn
         self.max_skip_steps = max_skip_steps
         self.verbose = verbose
+        self.track_action_stats = track_action_stats
 
         # Unwrap environment to access methods
         self.unwrapped_env = env.unwrapped
@@ -72,6 +95,9 @@ class DecentralizedEventDrivenExecutor:
         self.actionable_decisions = 0       # rule selected an order, produced a commit attempt
         self.noop_or_not_eligible = 0       # no candidates, drone busy/full, not at decision point
         self.commit_fail_by_reason = {}     # commit attempts that failed, keyed by reason
+
+        # Per-episode action-selection stats (populated only when track_action_stats=True)
+        self._action_stats: ActionStats = ActionStats()
 
         # Episode state
         self.episode_active = False
@@ -103,6 +129,7 @@ class DecentralizedEventDrivenExecutor:
         self.actionable_decisions = 0
         self.noop_or_not_eligible = 0
         self.commit_fail_by_reason = {}
+        self._action_stats = ActionStats()
         self.cumulative_reward = 0.0
         self.episode_active = True
 
@@ -207,6 +234,14 @@ class DecentralizedEventDrivenExecutor:
             # Call policy to get rule_id
             rule_id = self.policy_fn(local_obs)
 
+            # Track action stats when enabled
+            if self.track_action_stats:
+                self._action_stats.n_decisions += 1
+                if not (0 <= rule_id < 5):
+                    self._action_stats.n_invalid_rule += 1
+                else:
+                    self._action_stats.rule_counts[rule_id] += 1
+
             # Submit to centralized arbitrator (use with_info if available)
             if hasattr(self.unwrapped_env, 'apply_rule_to_drone_with_info'):
                 success, decision_info = self.unwrapped_env.apply_rule_to_drone_with_info(
@@ -232,6 +267,8 @@ class DecentralizedEventDrivenExecutor:
                 self.failed_decisions += 1
                 if reason in _noop_reasons:
                     self.noop_or_not_eligible += 1
+                    if self.track_action_stats and reason == 'no_order_selected':
+                        self._action_stats.n_empty_candidates += 1
                 else:
                     # Actionable but commit failed
                     self.actionable_decisions += 1
@@ -382,17 +419,44 @@ class DecentralizedEventDrivenExecutor:
             'commit_fail_by_reason': dict(self.commit_fail_by_reason),
         }
 
-    def run_episode(self, max_steps: int = 10000) -> Dict[str, Any]:
+    def get_action_stats(self) -> ActionStats:
+        """
+        Return per-episode action-selection statistics.
+
+        Only meaningful when ``track_action_stats=True`` was passed to the constructor.
+        Returns an :class:`ActionStats` instance with:
+        - ``rule_counts``: :class:`~collections.Counter` mapping rule_id → selection count
+        - ``n_decisions``: total number of decisions tracked
+        - ``n_invalid_rule``: decisions where policy returned a rule_id outside {0..4}
+        - ``n_empty_candidates``: decisions where no candidate was available (no_order_selected)
+        - ``to_percent()``: convenience method returning per-rule percentages
+        """
+        return self._action_stats
+
+    def run_episode(self, max_steps: int = 10000, seed: Optional[int] = None) -> Dict[str, Any]:
         """
         Run a complete episode from start to finish.
 
         Args:
             max_steps: Maximum number of decision steps
+            seed: Optional integer seed for deterministic episode execution.
+                When provided, seeds both numpy and Python's random module before
+                resetting the environment, ensuring reproducibility across runs.
 
         Returns:
             Episode statistics
         """
-        obs, info = self.reset()
+        if seed is not None:
+            # Seed both the global numpy/random state (for policy and stochastic
+            # library calls) and the environment's internal RNG (via reset(seed=)).
+            # Both are required for full cross-component reproducibility:
+            #   - np.random / random: policy outputs, any library-level sampling
+            #   - env reset seed: environment-internal order generation, events
+            np.random.seed(seed)
+            random.seed(seed)
+            obs, info = self.reset(seed=seed)
+        else:
+            obs, info = self.reset()
 
         for step_num in range(max_steps):
             obs, reward, terminated, truncated, info = self.step()

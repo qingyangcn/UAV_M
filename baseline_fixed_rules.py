@@ -80,7 +80,7 @@ def run_episode(args, rule_id: int, seed: int) -> dict:
             n_iterations=10,
             max_orders=200,
             max_orders_per_drone=10,
-            seed=args.seed,
+            seed=seed,
         )
         env.set_candidate_generator(candidate_generator)
 
@@ -94,7 +94,6 @@ def run_episode(args, rule_id: int, seed: int) -> dict:
     )
 
     executor.run_episode(max_steps=args.max_steps)
-    print(env.observation_space)
 
     stats = _compute_completion_stats(env)
     stats['seed'] = seed
