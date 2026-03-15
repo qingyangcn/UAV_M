@@ -20,6 +20,7 @@ Usage:
 
 import argparse
 import os
+import random
 import sys
 from collections import Counter
 
@@ -31,9 +32,6 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from UAV_ENVIRONMENT_11 import ThreeObjectiveDroneDeliveryEnv
 from U10_candidate_generator import MOPSOCandidateGenerator
 from U11_decentralized_execution import DecentralizedEventDrivenExecutor
-import numpy as np, random
-np.random.seed(42)
-random.seed(42)
 
 def random_policy(local_obs: dict) -> int:
     """Simple random policy for testing."""
@@ -266,8 +264,9 @@ def main():
 
     args = parser.parse_args()
 
-    # Set random seed
+    # Set random seeds deterministically from CLI argument
     np.random.seed(args.seed)
+    random.seed(args.seed)
 
     # Run sanity check
     try:
