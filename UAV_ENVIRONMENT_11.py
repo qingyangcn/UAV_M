@@ -169,10 +169,18 @@ class StateManager:
         cache = self.env._ready_orders_cache
         if new_status == OrderStatus.READY:
             cache.add(order_id)
+            # If coming from an active state, evict stale candidate entries so no
+            # other drone accidentally re-selects an order already being released.
+            if old_status in (OrderStatus.ASSIGNED, OrderStatus.PICKED_UP):
+                self._evict_order_from_candidate_caches(order_id)
         elif old_status == OrderStatus.READY:
             # Order is leaving READY: evict from all drone candidate caches immediately
             # so that no other drone can select a stale READY entry this step.
             cache.discard(order_id)
+            self._evict_order_from_candidate_caches(order_id)
+        elif old_status in (OrderStatus.ASSIGNED, OrderStatus.PICKED_UP):
+            # Order transitioning to DELIVERED, CANCELLED, etc.:
+            # evict stale candidate/cache entries unconditionally.
             self._evict_order_from_candidate_caches(order_id)
 
         # 记录状态变更
@@ -191,10 +199,13 @@ class StateManager:
     def _evict_order_from_candidate_caches(self, order_id: int):
         """Remove *order_id* from every per-drone candidate cache.
 
-        Called whenever an order leaves the READY state so that stale entries
-        cannot be selected by rules in subsequent drones during the same step.
+        Called whenever an order leaves the READY, ASSIGNED, or PICKED_UP state
+        so that stale entries cannot be selected in subsequent decisions.
         """
         env = self.env
+        # Signal that candidate mappings contain stale data.
+        env._candidate_mappings_dirty = True
+
         # 1. _filtered_candidates_sets: discard from every drone's set
         for drone_set in env._filtered_candidates_sets.values():
             drone_set.discard(order_id)
@@ -1370,6 +1381,9 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         # 状态管理器（放在 spaces 前后都行；这里放前面便于后续 reset/生成时用）
         # Initialize _ready_orders_cache before StateManager so update_order_status can use it
         self._ready_orders_cache: set = set()
+        # Dirty flag: set True whenever candidate caches are evicted; cleared by update_filtered_candidates.
+        # Consumers (get_decision_drones, candidate selectors) can use this as a hint to refresh.
+        self._candidate_mappings_dirty: bool = False
         self.state_manager = StateManager(self)
 
         # 定义 spaces：只使用固定 shape
@@ -1895,6 +1909,7 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
 
         # Reset incremental caches that depend on order state
         self._ready_orders_cache = set()
+        self._candidate_mappings_dirty = False
         self._filtered_candidates_sets = {}
         # Reset running order-history stats
         self._order_hist_merchant_ids = set()
@@ -2261,6 +2276,12 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                 drone_id = order.get('assigned_drone', -1)
                 if drone_id >= 0 and drone_id in self.drones:
                     drone = self.drones[drone_id]
+                    # Skip cargo repair for inactive drones: an IDLE/CHARGING drone
+                    # should not hold cargo.  The main loop below will resolve the
+                    # inconsistent PICKED_UP order instead of re-adding it to cargo
+                    # (which would then prevent the main loop from fixing it).
+                    if drone['status'] in (DroneStatus.IDLE, DroneStatus.CHARGING):
+                        continue
                     if order_id not in drone.get('cargo', set()):
                         # Repair: add to cargo
                         if 'cargo' not in drone:
@@ -2318,12 +2339,15 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
             drone = self.drones[drone_id]
 
             if drone['status'] in [DroneStatus.IDLE, DroneStatus.CHARGING]:
-                if order_id not in drone_real_orders.get(drone_id, set()):
-                    if order['status'] == OrderStatus.PICKED_UP:
-                        self._force_complete_order(order_id, drone_id)
-                    else:
-                        self._reset_order_to_ready(order_id, "drone_idle")
-                    continue
+                # An inactive drone must not own any ASSIGNED or PICKED_UP orders.
+                # Remove the drone_real_orders guard here: even if the order slipped
+                # into cargo (e.g. via the Invariant-1 repair before this loop ran),
+                # we still want to resolve it unconditionally.
+                if order['status'] == OrderStatus.PICKED_UP:
+                    self._force_complete_order(order_id, drone_id)
+                else:
+                    self._reset_order_to_ready(order_id, "drone_idle")
+                continue
 
             if drone['status'] == DroneStatus.RETURNING_TO_BASE:
                 if order['status'] == OrderStatus.ASSIGNED:
@@ -3750,7 +3774,10 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                                 )
                                 return
 
-                # If we couldn't perform pickup, clear serving order and go idle
+                # If we couldn't perform pickup, release the ASSIGNED order back to READY
+                # so it can be re-assigned to another drone.
+                if order.get('assigned_drone') == drone_id and order['status'] == OrderStatus.ASSIGNED:
+                    self._reset_order_to_ready(serving_order_id, "task_selection_pickup_failed")
                 drone['serving_order_id'] = None
                 self.state_manager.update_drone_status(drone_id, DroneStatus.IDLE, target_location=None)
 
@@ -3773,7 +3800,11 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                         self.state_manager.update_drone_status(drone_id, DroneStatus.IDLE, target_location=None)
                         return
 
-                # If we couldn't deliver, clear serving order and go idle
+                # If we couldn't deliver, release the PICKED_UP order back to READY
+                # so it can be re-routed to another drone.
+                if order.get('assigned_drone') == drone_id and order['status'] == OrderStatus.PICKED_UP:
+                    drone.get('cargo', set()).discard(serving_order_id)
+                    self._reset_order_to_ready(serving_order_id, "task_selection_delivery_failed")
                 drone['serving_order_id'] = None
                 self.state_manager.update_drone_status(drone_id, DroneStatus.IDLE, target_location=None)
 
@@ -3842,6 +3873,20 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                 self._safe_reset_drone(drone_id, drone)
 
         elif drone['status'] == DroneStatus.RETURNING_TO_BASE:
+            # Defensive: resolve any PICKED_UP/ASSIGNED orders that are still linked
+            # to this drone before we clear its state.  This guards against cases
+            # where the send-to-base path did not fully clean up (e.g. task-selection
+            # edge paths, direct status transitions, etc.).
+            for oid in list(self.active_orders):
+                if oid not in self.orders:
+                    continue
+                ord_ = self.orders[oid]
+                if ord_.get('assigned_drone') == drone_id:
+                    if ord_['status'] == OrderStatus.PICKED_UP:
+                        self._force_complete_order(oid, drone_id)
+                    elif ord_['status'] == OrderStatus.ASSIGNED:
+                        self._reset_order_to_ready(oid, "returning_base_arrival")
+
             if drone['battery_level'] < 80:
                 self.state_manager.update_drone_status(drone_id, DroneStatus.CHARGING, target_location=None)
             else:
@@ -5228,6 +5273,8 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
             drone_id: set(order_list)
             for drone_id, order_list in self.filtered_candidates.items()
         }
+        # Caches are now fresh; clear the dirty flag.
+        self._candidate_mappings_dirty = False
 
     def get_filtered_candidates_for_drone(self, drone_id: int) -> List[int]:
         """
@@ -5279,8 +5326,14 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         if status == OrderStatus.READY:
             # Must be genuinely unassigned (no drone has claimed it yet)
             return order.get('assigned_drone', -1) in (-1, None)
-        # ASSIGNED and PICKED_UP orders remain selectable (rules filter by drone_id)
-        return status in (OrderStatus.ASSIGNED, OrderStatus.PICKED_UP)
+        # ASSIGNED and PICKED_UP orders remain selectable only when their drone
+        # is actively working (not IDLE/CHARGING which indicates a stale reference).
+        if status in (OrderStatus.ASSIGNED, OrderStatus.PICKED_UP):
+            drone_id = order.get('assigned_drone', -1)
+            if drone_id < 0 or drone_id not in self.drones:
+                return False
+            return self.drones[drone_id]['status'] not in (DroneStatus.IDLE, DroneStatus.CHARGING)
+        return False
 
     # ================ U9: Event-driven single UAV decision support ================
 
