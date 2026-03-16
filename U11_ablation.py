@@ -52,12 +52,16 @@ def load_trained_policy(model_path: str, vecnormalize_path: str = None):
     """
     Load a trained PPO policy.
 
+    Supports the current Box/ndarray observation architecture: ``local_obs`` is a
+    flat ``np.ndarray`` and ``obs_rms`` (from VecNormalize) is a single
+    ``RunningMeanStd`` instance rather than a per-key dict.
+
     Args:
         model_path: Path to trained model (.zip file)
         vecnormalize_path: Path to VecNormalize stats (.pkl file)
 
     Returns:
-        Policy function that takes local_obs and returns rule_id
+        Policy function that takes local_obs (np.ndarray) and returns rule_id
     """
     try:
         from stable_baselines3 import PPO
@@ -84,16 +88,15 @@ def load_trained_policy(model_path: str, vecnormalize_path: str = None):
             _clip_obs = float(getattr(_vn, 'clip_obs', 10.0))
             _norm_obs = bool(getattr(_vn, 'norm_obs', True))
             _epsilon = float(getattr(_vn, 'epsilon', 1e-8))
-            if _norm_obs and _obs_rms:
+            if _norm_obs and _obs_rms is not None:
                 obs_rms = _obs_rms
                 clip_obs = _clip_obs
                 epsilon = _epsilon
                 print(f"VecNormalize stats loaded from: {vecnormalize_path}")
                 print(f"  norm_obs enabled, clip_obs={clip_obs}")
-                for key, rms in obs_rms.items():
-                    _mean_avg = float(np.array(rms.mean).mean())
-                    _std_avg = float(np.sqrt(np.array(rms.var).mean()))
-                    print(f"  obs_rms['{key}']: mean_avg={_mean_avg:.4f}, std_avg={_std_avg:.4f}")
+                _mean_avg = float(np.array(obs_rms.mean).mean())
+                _std_avg = float(np.sqrt(np.array(obs_rms.var).mean()))
+                print(f"  obs_rms: mean_avg={_mean_avg:.4f}, std_avg={_std_avg:.4f}")
             else:
                 print(f"VecNormalize loaded from: {vecnormalize_path} "
                       f"(norm_obs={_norm_obs}, no normalization applied)")
@@ -104,22 +107,15 @@ def load_trained_policy(model_path: str, vecnormalize_path: str = None):
         print(f"Warning: VecNormalize stats file not found: {vecnormalize_path}")
         print("  Proceeding without observation normalization.")
 
-    def policy_fn(local_obs: dict) -> int:
-        """Wrapper function for trained policy."""
+    def policy_fn(local_obs: np.ndarray) -> int:
+        """Wrapper function for trained policy (Box/ndarray observation space)."""
         if obs_rms is not None:
             # Apply VecNormalize observation normalization to match training preprocessing.
             # Replicates VecNormalize._normalize_obs: clip((obs - mean) / sqrt(var + eps), ±clip_obs)
-            normalized = {}
-            for key, obs in local_obs.items():
-                if key in obs_rms:
-                    rms = obs_rms[key]
-                    normalized[key] = np.clip(
-                        (obs - rms.mean) / np.sqrt(rms.var + epsilon),
-                        -clip_obs, clip_obs,
-                    ).astype(np.float32)
-                else:
-                    normalized[key] = obs
-            obs_to_predict = normalized
+            obs_to_predict = np.clip(
+                (local_obs - obs_rms.mean) / np.sqrt(obs_rms.var + epsilon),
+                -clip_obs, clip_obs,
+            ).astype(np.float32)
         else:
             obs_to_predict = local_obs
         action, _ = model.predict(obs_to_predict, deterministic=True)
@@ -344,7 +340,7 @@ def main():
     )
 
     # Environment parameters
-    parser.add_argument("--num-drones", type=int, default=10,
+    parser.add_argument("--num-drones", type=int, default=20,
                         help="Number of drones (default: 10)")
     parser.add_argument("--obs-max-orders", type=int, default=400,
                         help="Maximum orders in observation (default: 200)")
@@ -362,9 +358,9 @@ def main():
                         help="Maximum decision steps per episode (default: 500)")
 
     # Policy parameters
-    parser.add_argument("--model-path", type=str, default='ppo_u11_790000_steps.zip',
+    parser.add_argument("--model-path", type=str, default='ppo_u11_1010000_steps.zip',
                         help="Path to trained model (.zip file) - if not provided, uses random policy")
-    parser.add_argument("--vecnormalize-path", type=str, default='ppo_u11_vecnormalize_790000_steps.pkl',
+    parser.add_argument("--vecnormalize-path", type=str, default='ppo_u11_vecnormalize_1010000_steps.pkl',
                         help="Path to VecNormalize stats (.pkl file)")
 
     # Order cutoff parameter
