@@ -148,6 +148,8 @@ class StateManager:
         self.env = env
         # Bounded deque to prevent unbounded GC pressure over long training runs
         self.state_log = deque(maxlen=5000)
+        # First-anomaly snapshot: printed once to help diagnose index/status skew
+        self._first_anomaly_logged = False
 
     def update_order_status(self, order_id, new_status, reason=""):
         """统一更新订单状态"""
@@ -168,7 +170,10 @@ class StateManager:
         if new_status == OrderStatus.READY:
             cache.add(order_id)
         elif old_status == OrderStatus.READY:
+            # Order is leaving READY: evict from all drone candidate caches immediately
+            # so that no other drone can select a stale READY entry this step.
             cache.discard(order_id)
+            self._evict_order_from_candidate_caches(order_id)
 
         # 记录状态变更
         state_change = {
@@ -182,6 +187,31 @@ class StateManager:
         self.state_log.append(state_change)
 
         return True
+
+    def _evict_order_from_candidate_caches(self, order_id: int):
+        """Remove *order_id* from every per-drone candidate cache.
+
+        Called whenever an order leaves the READY state so that stale entries
+        cannot be selected by rules in subsequent drones during the same step.
+        """
+        env = self.env
+        # 1. _filtered_candidates_sets: discard from every drone's set
+        for drone_set in env._filtered_candidates_sets.values():
+            drone_set.discard(order_id)
+
+        # 2. filtered_candidates (list version): remove from every drone's list
+        for drone_id, cand_list in env.filtered_candidates.items():
+            if order_id in cand_list:
+                env.filtered_candidates[drone_id] = [
+                    oid for oid in cand_list if oid != order_id
+                ]
+
+        # 3. drone_candidate_mappings: mark as invalid (keep slot to preserve list length)
+        for drone_id, mapping in env.drone_candidate_mappings.items():
+            env.drone_candidate_mappings[drone_id] = [
+                (oid, False) if oid == order_id else (oid, valid)
+                for oid, valid in mapping
+            ]
 
     def update_drone_status(self, drone_id, new_status, target_location=None):
         """统一更新无人机状态"""
@@ -238,9 +268,11 @@ class StateManager:
     def get_state_consistency_check(self):
         """检查状态一致性 (Route-aware for Task B, Task-selection aware for U7)"""
         issues = []
+        first_anomaly_order_id = None  # tracks the order_id of the first issue found
 
         # 检查订单与无人机状态一致性
         for order_id, order in self.env.orders.items():
+            issues_before = len(issues)
             drone_id = order.get('assigned_drone')
             if drone_id is not None and drone_id >= 0:
                 if drone_id not in self.env.drones:
@@ -328,7 +360,57 @@ class StateManager:
                                 issues.append(
                                     f"[Legacy] 订单 {order_id} 已取货但无人机 {drone_id} 状态不匹配: {drone['status']}")
 
+            # Track the first order that triggered any new issues
+            if first_anomaly_order_id is None and len(issues) > issues_before:
+                first_anomaly_order_id = order_id
+
+        # First-anomaly snapshot: log detailed index state on the first issue ever found
+        if issues and first_anomaly_order_id is not None and not self._first_anomaly_logged:
+            self._log_first_anomaly_snapshot(first_anomaly_order_id, issues)
+
         return issues
+
+    def _log_first_anomaly_snapshot(self, order_id: int, issues: list):
+        """Print a one-time diagnostic snapshot the first time a consistency issue
+        is detected.  Records the full index/cache membership so it is easy to
+        tell whether 'status changed but index not updated' or 'double-transition'.
+        """
+        if self._first_anomaly_logged:
+            return
+        self._first_anomaly_logged = True
+
+        env = self.env
+        step = env.time_system.current_step
+        order = env.orders.get(order_id, {})
+        drone_id = order.get('assigned_drone', -1)
+        drone = env.drones.get(drone_id, {}) if drone_id is not None and drone_id >= 0 else {}
+
+        # Which drones' candidate mappings contain this order?
+        in_candidate_drones = [
+            d for d, mapping in env.drone_candidate_mappings.items()
+            if any(oid == order_id for oid, _ in mapping)
+        ]
+        in_filtered_drones = [
+            d for d, s in env._filtered_candidates_sets.items()
+            if order_id in s
+        ]
+
+        print(f"\n{'='*70}")
+        print(f"[ANOMALY SNAPSHOT] first consistency issue at step {step}")
+        print(f"  order_id       : {order_id}")
+        print(f"  order.status   : {order.get('status')}")
+        print(f"  in active_orders: {order_id in env.active_orders}")
+        print(f"  in _ready_orders_cache: {order_id in env._ready_orders_cache}")
+        print(f"  assigned_drone : {drone_id}")
+        print(f"  drone.status   : {drone.get('status')}")
+        print(f"  drone.serving_order_id: {drone.get('serving_order_id')}")
+        print(f"  drone.planned_stops len: {len(drone.get('planned_stops', []))}")
+        print(f"  in drone_candidate_mappings of drones: {in_candidate_drones}")
+        print(f"  in _filtered_candidates_sets of drones: {in_filtered_drones}")
+        print(f"  issues:")
+        for iss in issues:
+            print(f"    - {iss}")
+        print(f"{'='*70}\n")
 
     def _order_in_planned_stops(self, order_id, planned_stops):
         """Check if an order appears in the planned stops (D stop)"""
@@ -5157,7 +5239,24 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                 return order_ids
             return []
 
-        return [oid for oid in order_ids if oid in candidate_set]
+        return [oid for oid in order_ids if oid in candidate_set and self._is_candidate_selectable(oid)]
+
+    def _is_candidate_selectable(self, order_id: int) -> bool:
+        """Final dirty check: ensure an order in the candidate set is still selectable.
+
+        Guards against stale candidate entries when the order was cancelled,
+        delivered, or assigned to another drone between candidate refreshes.
+        A READY order must also be genuinely unassigned.
+        """
+        order = self.orders.get(order_id)
+        if order is None:
+            return False
+        status = order['status']
+        if status == OrderStatus.READY:
+            # Must be genuinely unassigned (no drone has claimed it yet)
+            return order.get('assigned_drone', -1) in (-1, None)
+        # ASSIGNED and PICKED_UP orders remain selectable (rules filter by drone_id)
+        return status in (OrderStatus.ASSIGNED, OrderStatus.PICKED_UP)
 
     # ================ U9: Event-driven single UAV decision support ================
 
