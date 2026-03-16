@@ -30,8 +30,15 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from UAV_ENVIRONMENT_11 import ThreeObjectiveDroneDeliveryEnv
-from U10_candidate_generator import MOPSOCandidateGenerator
 from U11_decentralized_execution import DecentralizedEventDrivenExecutor
+
+try:
+    from U10_candidate_generator import MOPSOCandidateGenerator
+
+    _HAS_MOPSO = True
+except ImportError:
+    _HAS_MOPSO = False
+
 
 def random_policy(local_obs: dict) -> int:
     """Simple random policy for testing."""
@@ -146,16 +153,17 @@ def run_sanity_check(args):
     )
 
     # Create MOPSO candidate generator
-    print("Creating MOPSO candidate generator...")
-    candidate_generator = MOPSOCandidateGenerator(
-        candidate_k=args.candidate_k,
-        n_particles=30,
-        n_iterations=10,
-        max_orders=200,
-        max_orders_per_drone=10,
-        seed=args.seed,
-    )
-    env.set_candidate_generator(candidate_generator)
+    if _HAS_MOPSO:
+        print("Creating MOPSO candidate generator...")
+        candidate_generator = MOPSOCandidateGenerator(
+            candidate_k=args.candidate_k,
+            n_particles=30,
+            n_iterations=10,
+            max_orders=200,
+            max_orders_per_drone=10,
+            seed=args.seed,
+        )
+        env.set_candidate_generator(candidate_generator)
 
     # Choose policy
     if args.model_path:

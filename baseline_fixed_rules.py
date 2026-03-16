@@ -113,7 +113,7 @@ def main():
                         help="Run all 5 fixed rules (0..4) sequentially")
     parser.add_argument("--seed", type=int, default=21,
                         help="Random seed for a single episode run (default: 42)")
-    parser.add_argument("--seeds", type=str, default=None,
+    parser.add_argument("--seeds", type=str, default='21',
                         help="Comma-separated seeds to run multiple episodes "
                              "(overrides --seed when provided)")
     parser.add_argument("--num-drones", type=int, default=20,

@@ -148,6 +148,8 @@ class StateManager:
         self.env = env
         # Bounded deque to prevent unbounded GC pressure over long training runs
         self.state_log = deque(maxlen=5000)
+        # First-anomaly snapshot: printed once to help diagnose index/status skew
+        self._first_anomaly_logged = False
 
     def update_order_status(self, order_id, new_status, reason=""):
         """统一更新订单状态"""
@@ -168,7 +170,10 @@ class StateManager:
         if new_status == OrderStatus.READY:
             cache.add(order_id)
         elif old_status == OrderStatus.READY:
+            # Order is leaving READY: evict from all drone candidate caches immediately
+            # so that no other drone can select a stale READY entry this step.
             cache.discard(order_id)
+            self._evict_order_from_candidate_caches(order_id)
 
         # 记录状态变更
         state_change = {
@@ -182,6 +187,31 @@ class StateManager:
         self.state_log.append(state_change)
 
         return True
+
+    def _evict_order_from_candidate_caches(self, order_id: int):
+        """Remove *order_id* from every per-drone candidate cache.
+
+        Called whenever an order leaves the READY state so that stale entries
+        cannot be selected by rules in subsequent drones during the same step.
+        """
+        env = self.env
+        # 1. _filtered_candidates_sets: discard from every drone's set
+        for drone_set in env._filtered_candidates_sets.values():
+            drone_set.discard(order_id)
+
+        # 2. filtered_candidates (list version): remove from every drone's list
+        for drone_id, cand_list in env.filtered_candidates.items():
+            if order_id in cand_list:
+                env.filtered_candidates[drone_id] = [
+                    oid for oid in cand_list if oid != order_id
+                ]
+
+        # 3. drone_candidate_mappings: mark as invalid (keep slot to preserve list length)
+        for drone_id, mapping in env.drone_candidate_mappings.items():
+            env.drone_candidate_mappings[drone_id] = [
+                (oid, False) if oid == order_id else (oid, valid)
+                for oid, valid in mapping
+            ]
 
     def update_drone_status(self, drone_id, new_status, target_location=None):
         """统一更新无人机状态"""
@@ -238,9 +268,11 @@ class StateManager:
     def get_state_consistency_check(self):
         """检查状态一致性 (Route-aware for Task B, Task-selection aware for U7)"""
         issues = []
+        first_anomaly_order_id = None  # tracks the order_id of the first issue found
 
         # 检查订单与无人机状态一致性
         for order_id, order in self.env.orders.items():
+            issues_before = len(issues)
             drone_id = order.get('assigned_drone')
             if drone_id is not None and drone_id >= 0:
                 if drone_id not in self.env.drones:
@@ -328,7 +360,57 @@ class StateManager:
                                 issues.append(
                                     f"[Legacy] 订单 {order_id} 已取货但无人机 {drone_id} 状态不匹配: {drone['status']}")
 
+            # Track the first order that triggered any new issues
+            if first_anomaly_order_id is None and len(issues) > issues_before:
+                first_anomaly_order_id = order_id
+
+        # First-anomaly snapshot: log detailed index state on the first issue ever found
+        if issues and first_anomaly_order_id is not None and not self._first_anomaly_logged:
+            self._log_first_anomaly_snapshot(first_anomaly_order_id, issues)
+
         return issues
+
+    def _log_first_anomaly_snapshot(self, order_id: int, issues: list):
+        """Print a one-time diagnostic snapshot the first time a consistency issue
+        is detected.  Records the full index/cache membership so it is easy to
+        tell whether 'status changed but index not updated' or 'double-transition'.
+        """
+        if self._first_anomaly_logged:
+            return
+        self._first_anomaly_logged = True
+
+        env = self.env
+        step = env.time_system.current_step
+        order = env.orders.get(order_id, {})
+        drone_id = order.get('assigned_drone', -1)
+        drone = env.drones.get(drone_id, {}) if drone_id is not None and drone_id >= 0 else {}
+
+        # Which drones' candidate mappings contain this order?
+        in_candidate_drones = [
+            d for d, mapping in env.drone_candidate_mappings.items()
+            if any(oid == order_id for oid, _ in mapping)
+        ]
+        in_filtered_drones = [
+            d for d, s in env._filtered_candidates_sets.items()
+            if order_id in s
+        ]
+
+        print(f"\n{'='*70}")
+        print(f"[ANOMALY SNAPSHOT] first consistency issue at step {step}")
+        print(f"  order_id       : {order_id}")
+        print(f"  order.status   : {order.get('status')}")
+        print(f"  in active_orders: {order_id in env.active_orders}")
+        print(f"  in _ready_orders_cache: {order_id in env._ready_orders_cache}")
+        print(f"  assigned_drone : {drone_id}")
+        print(f"  drone.status   : {drone.get('status')}")
+        print(f"  drone.serving_order_id: {drone.get('serving_order_id')}")
+        print(f"  drone.planned_stops len: {len(drone.get('planned_stops', []))}")
+        print(f"  in drone_candidate_mappings of drones: {in_candidate_drones}")
+        print(f"  in _filtered_candidates_sets of drones: {in_filtered_drones}")
+        print(f"  issues:")
+        for iss in issues:
+            print(f"    - {iss}")
+        print(f"{'='*70}\n")
 
     def _order_in_planned_stops(self, order_id, planned_stops):
         """Check if an order appears in the planned stops (D stop)"""
@@ -1137,6 +1219,8 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
 
         # ====== 独立 RNG（由 reset(seed=...) 重置，隔离环境随机流）======
         self.np_random = np.random.default_rng(0)
+        # 订单生成专用 RNG：与 np_random 完全隔离，保证不同策略下相同种子产生相同订单序列
+        self.order_rng = np.random.default_rng(1)
 
         # ====== 固定基础参数（init 一次性确定）======
 
@@ -1784,10 +1868,20 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         """重置环境 - 开始新的一天"""
         if seed is not None:
             self.np_random = np.random.default_rng(seed)
+            # Derive order_rng from the same seed but an independent stream so that
+            # policy/MOPSO code (which uses np_random) cannot shift order generation.
+            self.order_rng = np.random.default_rng(np.random.SeedSequence(seed).spawn(1)[0])
+        else:
+            # No explicit seed: advance order_rng from the current np_random state.
+            # _ORDER_RNG_SEED_BOUND is 2^31 (max value for a 32-bit signed-integer seed).
+            _ORDER_RNG_SEED_BOUND = 2 ** 31
+            self.order_rng = np.random.default_rng(int(self.np_random.integers(0, _ORDER_RNG_SEED_BOUND)))
 
-        # 将环境 RNG 传播给依赖子对象，确保随机流统一
+        # 将环境 RNG 传播给依赖子对象
+        # location_loader 使用 np_random（供 _handle_random_events 等模拟函数）
         self.location_loader.rng = self.np_random
-        self.order_processor.rng = self.np_random
+        # order_processor 使用专用 order_rng，与策略随机流隔离
+        self.order_processor.rng = self.order_rng
 
         self.time_system.reset()
         self.daily_stats['day_number'] = self.time_system.day_number
@@ -4149,18 +4243,18 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
             weather_type=self.weather
         )
 
-        if self.np_random.random() < order_prob:
+        if self.order_rng.random() < order_prob:
             if order_prob > 0.8:
-                base_batch = int(self.np_random.integers(3, 7))
+                base_batch = int(self.order_rng.integers(3, 7))
             elif order_prob > 0.5:
-                base_batch = int(self.np_random.integers(2, 5))
+                base_batch = int(self.order_rng.integers(2, 5))
             else:
-                base_batch = int(self.np_random.integers(1, 3))
+                base_batch = int(self.order_rng.integers(1, 3))
 
             batch_size = int(base_batch * self.high_load_factor)
 
             if time_state['is_peak_hour']:
-                batch_size += int(self.np_random.integers(1, 4))
+                batch_size += int(self.order_rng.integers(1, 4))
 
             for _ in range(batch_size):
                 self._generate_single_order()
@@ -4174,7 +4268,7 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
             order_details = self.order_processor.generate_order_details(env_time, self.weather)
 
             if order_details['merchant_id'] not in self.merchant_ids:
-                order_details['merchant_id'] = self.merchant_ids[int(self.np_random.integers(0, len(self.merchant_ids)))]
+                order_details['merchant_id'] = self.merchant_ids[int(self.order_rng.integers(0, len(self.merchant_ids)))]
 
             self._generate_order_with_details(order_details, order_id)
 
@@ -4185,17 +4279,17 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         try:
             merchant_id = order_details['merchant_id']
             if merchant_id not in self.merchants:
-                merchant_id = self.merchant_ids[int(self.np_random.integers(0, len(self.merchant_ids)))]
+                merchant_id = self.merchant_ids[int(self.order_rng.integers(0, len(self.merchant_ids)))]
 
             merchant_loc = self.merchants[merchant_id]['location']
             max_distance = order_details['max_distance']
             customer_loc = self._generate_customer_location(merchant_loc, max_distance)
 
-            if self.np_random.random() < 0.3:
+            if self.order_rng.random() < 0.3:
                 customer_loc = self._generate_distant_location(merchant_loc)
 
             weather_summary = self.weather_details.get('summary', 'Unknown')
-            preparation_time = int(order_details.get('preparation_time', int(self.np_random.integers(2, 7))))
+            preparation_time = int(order_details.get('preparation_time', int(self.order_rng.integers(2, 7))))
 
             order = {
                 'id': order_id,
@@ -4208,7 +4302,7 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                 'creation_step': self.time_system.current_step,  # explicit step-coordinate field for SC/GC stats
                 'assigned_drone': -1,
                 'preparation_time': preparation_time,  # step
-                'urgent': self.np_random.random() < order_details['urgency'],
+                'urgent': self.order_rng.random() < order_details['urgency'],
                 'weather_conditions': weather_summary
             }
 
@@ -4241,27 +4335,39 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
     def _generate_distant_location(self, merchant_loc):
         merchant_x, merchant_y = merchant_loc
         edges = ['top', 'bottom', 'left', 'right']
-        edge = edges[int(self.np_random.integers(0, len(edges)))]
+        edge = edges[int(self.order_rng.integers(0, len(edges)))]
         if edge == 'top':
-            return self.np_random.uniform(0, self.grid_size - 1), self.grid_size - 1
+            return self.order_rng.uniform(0, self.grid_size - 1), self.grid_size - 1
         elif edge == 'bottom':
-            return self.np_random.uniform(0, self.grid_size - 1), 0
+            return self.order_rng.uniform(0, self.grid_size - 1), 0
         elif edge == 'left':
-            return 0, self.np_random.uniform(0, self.grid_size - 1)
+            return 0, self.order_rng.uniform(0, self.grid_size - 1)
         else:
-            return self.grid_size - 1, self.np_random.uniform(0, self.grid_size - 1)
+            return self.grid_size - 1, self.order_rng.uniform(0, self.grid_size - 1)
 
     def _generate_customer_location(self, merchant_loc, max_distance):
+        loc_loader = self.location_loader
         for _ in range(10):
-            customer_loc = self.location_loader.get_random_user_grid_location()
+            # Use order_rng directly to stay within the isolated order-generation stream
+            if loc_loader.user_locations:
+                idx = int(self.order_rng.integers(0, len(loc_loader.user_locations)))
+                user = loc_loader.user_locations[idx]
+                customer_loc = loc_loader.convert_to_grid_coordinates(
+                    user['longitude'], user['latitude']
+                )
+            else:
+                customer_loc = (
+                    self.order_rng.uniform(0, self.grid_size - 1),
+                    self.order_rng.uniform(0, self.grid_size - 1)
+                )
             distance = self._calculate_euclidean_distance(merchant_loc, customer_loc)
             if distance <= max_distance:
                 return customer_loc
 
         merchant_x, merchant_y = merchant_loc
         return (
-            max(0, min(self.grid_size - 1, merchant_x + int(self.np_random.integers(-2, 3)))),
-            max(0, min(self.grid_size - 1, merchant_y + int(self.np_random.integers(-2, 3))))
+            max(0, min(self.grid_size - 1, merchant_x + int(self.order_rng.integers(-2, 3)))),
+            max(0, min(self.grid_size - 1, merchant_y + int(self.order_rng.integers(-2, 3))))
         )
 
     def _calculate_euclidean_distance(self, loc1, loc2):
@@ -5157,7 +5263,24 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                 return order_ids
             return []
 
-        return [oid for oid in order_ids if oid in candidate_set]
+        return [oid for oid in order_ids if oid in candidate_set and self._is_candidate_selectable(oid)]
+
+    def _is_candidate_selectable(self, order_id: int) -> bool:
+        """Final dirty check: ensure an order in the candidate set is still selectable.
+
+        Guards against stale candidate entries when the order was cancelled,
+        delivered, or assigned to another drone between candidate refreshes.
+        A READY order must also be genuinely unassigned.
+        """
+        order = self.orders.get(order_id)
+        if order is None:
+            return False
+        status = order['status']
+        if status == OrderStatus.READY:
+            # Must be genuinely unassigned (no drone has claimed it yet)
+            return order.get('assigned_drone', -1) in (-1, None)
+        # ASSIGNED and PICKED_UP orders remain selectable (rules filter by drone_id)
+        return status in (OrderStatus.ASSIGNED, OrderStatus.PICKED_UP)
 
     # ================ U9: Event-driven single UAV decision support ================
 
