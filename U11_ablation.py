@@ -340,7 +340,7 @@ def main():
     )
 
     # Environment parameters
-    parser.add_argument("--num-drones", type=int, default=10,
+    parser.add_argument("--num-drones", type=int, default=20,
                         help="Number of drones (default: 10)")
     parser.add_argument("--obs-max-orders", type=int, default=400,
                         help="Maximum orders in observation (default: 200)")
@@ -358,9 +358,9 @@ def main():
                         help="Maximum decision steps per episode (default: 500)")
 
     # Policy parameters
-    parser.add_argument("--model-path", type=str, default='ppo_u11_790000_steps.zip',
+    parser.add_argument("--model-path", type=str, default='ppo_u11_1010000_steps.zip',
                         help="Path to trained model (.zip file) - if not provided, uses random policy")
-    parser.add_argument("--vecnormalize-path", type=str, default='ppo_u11_vecnormalize_790000_steps.pkl',
+    parser.add_argument("--vecnormalize-path", type=str, default='ppo_u11_vecnormalize_1010000_steps.pkl',
                         help="Path to VecNormalize stats (.pkl file)")
 
     # Order cutoff parameter

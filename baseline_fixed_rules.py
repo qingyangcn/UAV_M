@@ -109,7 +109,7 @@ def main():
 
     parser.add_argument("--rule-id", type=int, default=2,
                         help="Fixed rule ID in {0,1,2,3,4} (required unless --all-rules)")
-    parser.add_argument("--all-rules", action="store_true", default=False,
+    parser.add_argument("--all-rules", action="store_true", default=True,
                         help="Run all 5 fixed rules (0..4) sequentially")
     parser.add_argument("--seed", type=int, default=21,
                         help="Random seed for a single episode run (default: 42)")
