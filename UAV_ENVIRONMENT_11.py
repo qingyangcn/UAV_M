@@ -1862,6 +1862,19 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
 
             self.drone_candidate_mappings[drone_id] = candidates[:K]
 
+    # ------------------ high_load_factor control ------------------
+
+    def set_high_load_factor(self, value: float) -> None:
+        """Set high_load_factor for the next episode.
+
+        Call this before reset() to change the order generation intensity.
+        The new value takes effect from the next reset() call onward.
+
+        Args:
+            value: New high_load_factor (e.g. 1.3 – 1.8).  Typically > 1.0.
+        """
+        self.high_load_factor = float(value)
+
     # ------------------ reset / step ------------------
 
     def reset(self, seed=None, options=None):
@@ -1969,6 +1982,7 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         print(f"营业时间: {self.time_system.start_hour}:00 - {self.time_system.end_hour}:00")
         print(f"今日天气: {self.weather_details.get('summary', 'Unknown')}")
         print(f"无人机数量: {self.num_drones}, 订单观测窗口: {self.max_obs_orders}, 商家TopK: {self.obs_num_merchants}")
+        print(f"高负载因子(high_load_factor): {self.high_load_factor:.2f}")
 
         return obs, info
 
